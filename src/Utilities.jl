@@ -215,9 +215,9 @@ function compute_operator_norms(A::SparseMatrixCSC)
 
     p = n > 10^8 ? 125 : n > 2.5*10^7 ? 250 : n > 10^7 ? 400 : n > 2.5 * 10^6 ? 600 : n > 10^6 ? 550 : n > 500000 ? 500 : n > 250000 ? 400 : n > 100000 ? 300 : n > 50000 ? 200 : 100
 
-    spectral_norm = symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1];
-    infinity_norm = maximum(sum(abs.(A), dims=1));
-    frobenius_norm = sqrt(sum(x -> x^2, A.nzval));
+    spectral_norm::Float64 = symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1];
+    infinity_norm::Float64 = maximum(sum(abs.(A), dims=1));
+    frobenius_norm::Float64 = sqrt(sum(x -> x^2, A.nzval));
 
     D = diag(A) |> D -> 1 ./ sqrt.(D) |> D -> Diagonal(D)
 
@@ -227,7 +227,7 @@ function compute_operator_norms(A::SparseMatrixCSC)
     J = J * D
     # this is the spectral radius of the Jacobi iteration matrix when A is SPD only
     # going to need to rewrite this for non-SPD matrices
-    jacobian_norm = symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1] 
+    jacobian_norm::Float64 = symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1] 
 
     return norm_information(spectral_norm, infinity_norm, frobenius_norm, jacobian_norm)
 

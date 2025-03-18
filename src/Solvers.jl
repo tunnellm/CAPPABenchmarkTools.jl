@@ -177,7 +177,7 @@ function preconditioned_conjugate_gradient(
 
     np = norm(p)
 
-    pcg_print(compressed_data_stream, 0, compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)..., (preconditioner.system.seed), base_cost, prec_cost, μ, r, rz_old, pprod, np, Ax, x, preconditioner.system.b)
+    pcg_print(compressed_data_stream, 0, compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)..., norm(preconditioner.system.seed), base_cost, prec_cost, μ, r, rz_old, pprod, np, Ax, x, preconditioner.system.b)
 
     for i in 1:maxiters
         iter = i

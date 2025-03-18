@@ -761,7 +761,7 @@ Constructs a Truncated Neumann series preconditioner using the scaled version of
 # Arguments
 - `mat::problem_interface`: The problem interface containing different representations of the system.
 - `num_iters::Int64`: The number of iterations for the truncated Neumann series expansion.
-- `norm::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
+- `norm_::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
 
 # Returns
 - `Preconditioner`: A struct encapsulating the Truncated Neumann preconditioner.
@@ -774,8 +774,8 @@ Constructs a Truncated Neumann series preconditioner using the scaled version of
 - If `norm == 0`, `α` is computed as `1`, otherwise `α = 1 / norm`.
 - The number of multiplications is estimated as `num_iters * nnz(A)`, accounting for all matrix-vector products.
 """
-function TruncatedNeumann(mat::problem_interface, num_iters::Int64, norm::Float64)
-    return TruncatedNeumann(mat.Scaled, num_iters, norm)
+function TruncatedNeumann(mat::problem_interface, num_iters::Int64, norm_::Float64)
+    return TruncatedNeumann(mat.Scaled, num_iters, norm_)
 end
 
 
@@ -787,7 +787,7 @@ Constructs a Truncated Neumann series preconditioner using the scaled version of
 # Arguments
 - `mat::problem_interface`: The problem interface containing different representations of the system.
 - `num_iters::Int64`: The number of iterations for the truncated Neumann series expansion.
-- `norm::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
+- `norm_::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
 
 # Returns
 - `Preconditioner`: A struct encapsulating the Truncated Neumann preconditioner.
@@ -801,9 +801,9 @@ where `α` is chosen as `1/‖A‖` for stability.
 - The function performs iterative matrix-vector multiplications to construct the preconditioner.
 - The total number of multiplications is estimated as `num_iters * nnz(A)`, accounting for all matrix-vector products.
 """
-function TruncatedNeumann(input::package, num_iters::Int64, norm::Float64)
+function TruncatedNeumann(input::package, num_iters::Int64, norm_::Float64)
 
-    β = norm == -1.0 ? 0.5 * input.norms.spectral_norm : norm == 0 ? 1 : LA.norm(input.A, norm)
+    β = norm_ == -1.0 ? 0.5 * input.norms.spectral_norm : norm_ == 0.0 ? 1.0 : norm(input.A, norm_)
     α = 1.0 / β
 
     w = zeros(size(input.A, 1))
@@ -820,7 +820,7 @@ function TruncatedNeumann(input::package, num_iters::Int64, norm::Float64)
         end
         product .*= α
     end
-    num_multiplications = num_iters * SA.nnz(input.A)
+    num_multiplications = num_iters * nnz(input.A)
     println("Created Truncated Neumann Preconditioner for $(input.name) with $num_iters iterations.")
     return Preconditioner(LinearOperator, num_multiplications, input)
 end
@@ -1452,7 +1452,7 @@ end
 
 function CombinatorialMG(mat::package)
     try
-        work_lookup = CSV.read(cmg_path, DataFrame)
+        work_lookup = CSV.read(joinpath(DEP_DIR, "CombinatorialWorkCost.csv"), DataFrame)
 
         idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
 
