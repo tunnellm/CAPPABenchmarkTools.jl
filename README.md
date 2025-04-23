@@ -61,7 +61,7 @@ or load just what you need:
 
 ```julia
 using CAPPABenchmarkTools.Utilities
-using CAPPABenchmarkTools: Preconditioner, run_cg
+using CAPPABenchmarkTools: Preconditioner, preconditioned_conjugate_gradient
 ```
 
 ## Quickstart guide
