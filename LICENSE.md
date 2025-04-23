@@ -1,4 +1,4 @@
-CAPPABenchmarkTools is licensed under the MIT License:
+CAPPABenchmarkTools.jl is licensed under the MIT License:
 
 >  The MIT License (MIT)
 >  
