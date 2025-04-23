@@ -1,6 +1,6 @@
 # CAPPABenchmarkTools.jl
 
-[![Coverage Status](https://coveralls.io/repos/github/tunnellm/CAPPABenchmarkTools/badge.svg?branch=main)](https://coveralls.io/github/tunnellm/CAPPABenchmarkTools?branch=main)
+[![Coverage Status](https://coveralls.io/repos/github/tunnellm/CAPPABenchmarkTools.jl/badge.svg?branch=main)](https://coveralls.io/github/tunnellm/CAPPABenchmarkTools.jl?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)  
 
 A lightweight Julia toolbox for benchmarking sparse linear solvers and preconditioners.
