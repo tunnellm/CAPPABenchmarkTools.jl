@@ -1,14 +1,14 @@
 # CAPPABenchmarkTools.jl
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)  
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
 A lightweight Julia toolbox for benchmarking sparse linear solvers and preconditioners.
 
 ## Features
 
-- **Sparse triangular solves** via built-in and custom kernels  
-- **CG** and **MINRES** implementations that emit per-iteration data for detailed profiling  
-- **Uniform “preconditioner” wrapper**—turn any Julia‐callable into a `Preconditioner` object that tracks operator applications  
+- **Sparse triangular solves** via built-in and custom kernels
+- **CG** and **MINRES** implementations that emit per-iteration data for detailed profiling
+- **Uniform “preconditioner” wrapper**—turn any Julia‐callable into a `Preconditioner` object that tracks operator applications
 - Utilities for loading MatrixMarket graphs & matrices, computing norms, reordering, scaling, and more
 
 ## Installation
