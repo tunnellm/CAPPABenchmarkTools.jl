@@ -153,6 +153,19 @@ All behind-the-scenes routines live in `Utilities`:
 - Norms & tolerances: `compute_operator_norms`, `compute_tolerances`
 - Problem inspection: `is_laplacian`, `is_sdd`
 
+## Use this repository in your research?
 
+```
+@misc{tunnell_arxiv_2025,
+  doi = {10.48550/ARXIV.2505.20696},
+  url = {https://arxiv.org/abs/2505.20696},
+  author = {Tunnell,  Marc A. and Gleich,  David F.},
+  keywords = {Numerical Analysis (math.NA),  FOS: Mathematics,  FOS: Mathematics},
+  title = {An Empirical Study of Conjugate Gradient Preconditioners for Solving Symmetric Positive Definite Systems of Linear Equations},
+  publisher = {arXiv},
+  year = {2025},
+  copyright = {arXiv.org perpetual,  non-exclusive license}
+}
+```
 
 License: This project is MIT-licensed. See [license](LICENSE.md).
