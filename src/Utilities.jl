@@ -22,7 +22,7 @@ using MatrixMarket
 using Laplacians
 using GenericArpack
 
-export check_previous, load_matrix_names 
+export check_previous, load_matrix_names, do_log
 export load_matrix, load_graph, package
 export norm_information
 export compute_tolerances, compute_operator_norms
@@ -123,6 +123,11 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
             end
         catch e
             @warn "Error occurred while reading raw data: $e"
+            open(joinpath(path, preconditioner_name, "log.txt"), "a") do f
+                write(f, "$(time())\n")
+                write(f, e)
+                write(f, "\n")
+            end
             return -1
         end
         close(stream)
@@ -153,6 +158,18 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
     return maximum_iterations
 end
 
+"""
+    do_log(location::String, error_message::String)
+
+Appends an error message to a log file at the specified location, including a timestamp.
+"""
+function do_log(location, error_message)
+    open(location, "a") do f
+        write(f, "$(time())\n")
+        write(f, error_message)
+        write(f, "\n")
+    end
+end
 
 
 """
@@ -610,7 +627,7 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
     # Apply scaling =
     if SPD
         println("Scaling $(filename).")
-        A_Unscaler = sqrt.(diag(A_Scaled, 0))
+        A_Unscaler = sqrt.(abs.(diag(A_Scaled, 0)))
         A_Scaler = 1.0 ./ A_Unscaler |> spdiagm
         A_Unscaler = A_Unscaler |> spdiagm
         A_Scaled = A_Scaler * A_Scaled * A_Scaler
@@ -657,7 +674,10 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
     local scaled_norms
     local unscaled_norms
 
-    if !norms_exists  # Compute norms using Scipy
+    if !SPD
+        scaled_norms = norm_information(0.0, 0.0, 0.0, 0.0)
+        unscaled_norms = norm_information(0.0, 0.0, 0.0, 0.0)
+    elseif !norms_exists  # Compute norms using Scipy
 
         println("Computing scaled norms")
         scaled_norms = compute_operator_norms(A_Scaled)

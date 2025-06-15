@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
-A lightweight Julia toolbox for benchmarking sparse linear solvers and preconditioners.
+A lightweight Julia toolbox for benchmarking sparse linear solvers and preconditioners. See the accompanying paper on [arXiv](https://doi.org/10.48550/arXiv.2505.20696) and view the most up-to-date data on our [repository of results](tunnellm.github.io/CAPPA-repository/).
 
 ## Features
 

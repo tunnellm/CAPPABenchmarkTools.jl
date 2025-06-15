@@ -96,6 +96,7 @@ function run_matrix(matrix_name::String, preconditioners::Vector{Function}, args
     return
 end
 
+
 """
     run_matrix(
         matrix::problem_interface,
@@ -187,6 +188,8 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
         end
         if cg_iters > 0 && mr_iters > 0
             println("Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
+            run_conjugate_gradient && do_log(joinpath(cg_location, output_filename, "log.txt"), "Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
+            run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), "Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
             continue
         end
         try
@@ -196,8 +199,10 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
                 p = preconditioner(matrix, args[i]...)
             end
         catch e
-            println(e)
+            # println(e)
             println("Error in preconditioner $(string(preconditioner)) for $(matrix.name), $(matrix.name)")
+            run_conjugate_gradient && do_log(joinpath(cg_location, output_filename, "log.txt"), e)
+            run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), e)
             continue
         end
 
@@ -206,10 +211,12 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
             mkpath(output_location)
             try
                 iters = preconditioned_conjugate_gradient(p, control_iters_cg, output_location * "raw_data.csv.zstd", output_location * "convergence_data"; work_limit=4*cg_control_work)
-                println(iter_print_statement(matrix.name, string(preconditioner), "Conjugate Gradient", control_iters_cg, iters))
+                statement = iter_print_statement(matrix.name, string(preconditioner), "Conjugate Gradient", control_iters_cg, iters)
+                do_log(joinpath(cg_location, output_filename, "log.txt"), statement)
+                println(statement)
             catch e
                 println("Error returned by Conjugate Gradient for preconditioner $(string(preconditioner)) for matrix $(matrix.name)")
-                continue
+                do_log(joinpath(cg_location, output_filename, "log.txt"), e)
             end
         end
         if mr_iters <= 0 && run_minres == true
@@ -217,10 +224,12 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
             mkpath(output_location)
             try
                 iters = preconditioned_minres(p, control_iters_mr, output_location * "raw_data.csv.zstd", output_location * "convergence_data"; work_limit=4*mr_control_work)
-                println(iter_print_statement(matrix.name, string(preconditioner), "MINRES", control_iters_mr, iters))
+                statement = iter_print_statement(matrix.name, string(preconditioner), "MINRES", control_iters_mr, iters)
+                do_log(joinpath(mr_location, output_filename, "log.txt"), statement)
+                println(statement)
             catch e
                 println("Error returned by MINRES for preconditioner $(string(preconditioner)) for matrix $(matrix.name)")
-                continue
+                do_log(joinpath(mr_location, output_filename, "log.txt"), e)
             end
         end
     end

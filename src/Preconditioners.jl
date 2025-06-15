@@ -718,8 +718,10 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     dc = PyCall.pybuiltin("dict")
     ilu = scipy.linalg.spilu(A, fill_factor=fill, drop_tol=drop_tolerance, 
         # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
-        options=dc(Equil=false,RowPerm="NOROWPERM", 
-        ColPerm="NATURAL",
+        options=dc(
+            Equil=false,
+            RowPerm="NOROWPERM", 
+            ColPerm="NATURAL",
         # ColPerm="MMD_AT_PLUS_A",
         # ColPerm="MMD_AT_PLUS_A",
         SymmetricMode=true,

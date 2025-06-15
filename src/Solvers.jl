@@ -180,6 +180,7 @@ function preconditioned_conjugate_gradient(
     pcg_print(compressed_data_stream, 0, compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)..., norm(preconditioner.system.seed), base_cost, prec_cost, μ, r, rz_old, pprod, np, Ax, x, preconditioner.system.b)
 
     for i in 1:maxiters
+
         iter = i
 
         rz_new = r' * z
@@ -192,6 +193,8 @@ function preconditioned_conjugate_gradient(
         end
         mul!(prod, preconditioner.system.A', p)
 
+        
+
         pprod = p' * prod
 
         μ = rz_new / pprod
@@ -202,6 +205,8 @@ function preconditioned_conjugate_gradient(
 
         preconditioner.LinearOperator(z, r)
 
+        
+
         rz_old = rz_new
 
         if preconditioner.system.nullspace > 0
@@ -209,6 +214,8 @@ function preconditioned_conjugate_gradient(
         else
             x_true .= x
         end
+
+        
 
         mul!(Ax, preconditioner.system.A', x_true)
 
@@ -301,11 +308,6 @@ function preconditioned_conjugate_gradient(
                 @goto relnormwisef
             end
         end
-        
-        if ((abs(μ) * np) < 10^(-20)) 
-            iter = -1
-            break
-        end
 
         if (isempty(relative_residual_tolerances) && isempty(relative_normwise_2_tolerances) && isempty(relative_normwise_i_tolerances) && isempty(relative_normwise_f_tolerances))
             break
@@ -317,15 +319,6 @@ function preconditioned_conjugate_gradient(
             break
         end
 
-        # if norm(μ * p) < eps(1.0)
-        #     no_update += 1
-        #     if no_update > 1000
-        #         iter = -1
-        #         break
-        #     end
-        # else
-        #     no_update = 0
-        # end
     end
     close(compressed_data_stream)
     close(raw_data_stream)
