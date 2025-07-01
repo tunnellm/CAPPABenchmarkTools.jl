@@ -1166,7 +1166,7 @@ function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, Î
 
         n = size(input.A, 1)
 
-        num_multiplications = 2*n*r + r
+        num_multiplications = 2*n*truncation + truncation
 
         generation_cost = nnz(input.A) * rank + 3*n*r^2 + (r^3-3)/6 + (n+1)*r*(r-1)/2
 
