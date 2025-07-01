@@ -1175,7 +1175,7 @@ function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, Î
 
         num_multiplications = 2*n*truncation + truncation
 
-        generation_cost = nnz(input.A) * rank + 3*n*r^2 + (r^3-3)/6 + (n+1)*r*(r-1)/2
+        generation_cost = nnz(input.A) * rank + 3*n*rank^2 + (rank^3-3)/6 + (n+1)*rank*(rank-1)/2
 
         println("Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.")
 
