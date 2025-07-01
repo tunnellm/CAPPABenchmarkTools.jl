@@ -1143,15 +1143,15 @@ function LimitedLDL(input::package, memory::Integer, droptol::Real)
     end
 end
 
-function RandomizedNystrom(input::problem_interface, rank::Integer, truncation::Integer, μ::Real)
+function RandomizedNystrom(input::problem_interface, rank::Integer, truncation::Integer, μ::Real, dummy_variable::Int=0)
 
     @assert truncation ≤ rank "Truncation must be less than or equal to rank"
 
-    return RandomizedNystrom(input.Scaled, rank, truncation, μ)
+    return RandomizedNystrom(input.Scaled, rank, truncation, μ, dummy_variable)
 
 end
 
-function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, μ::Real)
+function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, μ::Real, dummy_variable::Int=0)
 
     @assert truncation ≤ rank "Truncation must be less than or equal to rank"
 
@@ -1170,12 +1170,12 @@ function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, �
 
         generation_cost = nnz(input.A) * rank + 3*n*r^2 + (r^3-3)/6 + (n+1)*r*(r-1)/2
 
-        println("Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation.")
+        println("Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.")
 
         return Preconditioner(LinearOperator, num_multiplications, Float64(generation_cost), input)
 
     catch e
-        println("Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation.")
+        println("Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.")
         rethrow(e)
     end
 
