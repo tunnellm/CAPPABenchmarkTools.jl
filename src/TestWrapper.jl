@@ -210,6 +210,7 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
             output_location = cg_location * output_filename
             mkpath(output_location)
             try
+                do_log(joinpath(cg_location, output_filename, "generation_work.txt"), string(p.generation_work))
                 iters = preconditioned_conjugate_gradient(p, control_iters_cg, output_location * "raw_data.csv.zstd", output_location * "convergence_data"; work_limit=4*cg_control_work)
                 statement = iter_print_statement(matrix.name, string(preconditioner), "Conjugate Gradient", control_iters_cg, iters)
                 do_log(joinpath(cg_location, output_filename, "log.txt"), statement)
@@ -223,6 +224,7 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
             output_location = mr_location * output_filename
             mkpath(output_location)
             try
+                do_log(joinpath(mr_location, output_filename, "generation_work.txt"), string(p.generation_work))
                 iters = preconditioned_minres(p, control_iters_mr, output_location * "raw_data.csv.zstd", output_location * "convergence_data"; work_limit=4*mr_control_work)
                 statement = iter_print_statement(matrix.name, string(preconditioner), "MINRES", control_iters_mr, iters)
                 do_log(joinpath(mr_location, output_filename, "log.txt"), statement)
