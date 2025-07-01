@@ -1120,10 +1120,16 @@ end
 
 function LimitedLDL(input::package, memory::Integer, droptol::Real)
 
+    nznum = (nnz(input.A) - size(input.A, 1)) / 2
+
+    nzpercol = nznum / size(input.A, 1)
+
+    memory_val = ceil(Int, nzpercol * memory)
+
     try
         
         ldl = LimitedLDLFactorizations.lldl(input.A; P = collect(1:size(input.A, 1)), 
-            memory = memory, droptol = droptol)
+            memory = memory_val, droptol = droptol)
 
         function LinearOperator(y, r)
             y .= ldl \ r
