@@ -10,6 +10,10 @@ using Statistics
 import Laplacians
 import CombinatorialMultigrid
 using LDLFactorizations
+
+import RandomizedPreconditioners
+import LimitedLDLFactorizations
+
 import PyCall
 import MATLAB
 
@@ -39,16 +43,19 @@ Represents a preconditioner for an iterative solver.
 # Arguments
 - `LinearOperator::Function`: A function that applies the preconditioner to a given vector.
 - `num_multiplications::UInt64`: The estimated number of nonzero multiplications performed by the preconditioner.
+- `generation_work::Float64`: An estimate of the computational work required to generate the preconditioner. If unknown, use `Inf`.
 - `system::package`: The system associated with the preconditioner, including the matrix and problem metadata.
 
 # Notes
 - The `LinearOperator` function takes a solution vector and a right-hand side vector as inputs and modifies the solution in place.
 - `num_multiplications` provides a measure of the computational cost of applying the preconditioner.
+- `generation_work::Float64` provides an estimate of the computational work required to generate the preconditioner. Inf is used when unknown.
 - This struct is used to encapsulate different types of preconditioners while maintaining a consistent interface for iterative solvers.
 """
 struct Preconditioner
     LinearOperator::Function
     num_multiplications::UInt64
+    generation_work::Float64
     system::package
 end
 
@@ -131,7 +138,7 @@ function SOR(input::package, ω::Float64, num_iters::Int64)
     end
     num_multiplications = (nnz(matrix) + 2 * sz) * num_iters
     println("Created SOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -198,7 +205,7 @@ function SteepestDescent(input::package, num_iters::Int64)
 
     println("Created Steepest Descent Preconditioner for $(input.name) with $num_iters iterations.")
 
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -293,7 +300,7 @@ function SSOR(input::package, ω::Float64, num_iters::Int64)
     end
     num_multiplications = 2 * (nnz(matrix) + 2 * sz) * num_iters
     println("Created SSOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -370,7 +377,7 @@ function GaussSeidel(input::package, num_iters::Int64)
     end
     num_multiplications = nnz(matrix) * num_iters
     println("Created Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -460,7 +467,7 @@ function SymmetricGaussSeidel(input::package, num_iters::Int64)
     end
     num_multiplications = 2 * nnz(matrix) * num_iters
     println("Created Symmetric Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -544,8 +551,12 @@ function IncompleteCholesky(input::package, drop_tol::Float64, fill::Int64, mich
             y .= sparse_triangular_solve(l, u, r)
         end
         num_multiplications = 2 * nnz(u)
+
+        # the following is a coarse approximation of generation work. This will be an undercount for thresholded factorizations.
+        generation_work = sum(x -> x^2, u.colptr[2:end] .- u.colptr[1:end-1])
+
         println("Created Incomplete Cholesky Preconditioner for $(input.name).")
-        return Preconditioner(LinearOperator, num_multiplications, input)
+        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
     catch y
         println("Error creating the Incomplete Cholesky Preconditioner for $(input.name).")
         rethrow(y)
@@ -651,8 +662,13 @@ function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering
         y .= ilu.solve(r)
     end
     num_multiplications = ilu.L.nnz + ilu.U.nnz
+
+    # Estimate the generation work as the sum of nonzeros in L and U
+    # This is a coarse approximation, as it does not account for thresholding effects.
+    generation_work = sum(x -> x, (ilu.L.colptr[2:end] .- ilu.L.colptr[1:end-1]) .* (ilu.U.colptr[2:end] .- ilu.U.colptr[1:end-1]))
+    
     println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
 end
 
 
@@ -750,8 +766,11 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
         y .= sparse_triangular_solve(copy(L'), copy(L), r)
     end
     num_multiplications = 2 * ilu.U.nnz
+
+    generation_work = sum(x -> x, (L.colptr[2:end] .- L.colptr[1:end-1]) .* (U.colptr[2:end] .- U.colptr[1:end-1]))
+
     println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
 end
 
 
@@ -824,7 +843,7 @@ function TruncatedNeumann(input::package, num_iters::Int64, norm_::Float64)
     end
     num_multiplications = num_iters * nnz(input.A)
     println("Created Truncated Neumann Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 
@@ -887,8 +906,9 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
         MATLAB.put_variable(session, :fl, ceil(fill_factor * Float64(ceil(nnz(input.A) / size(input.A, 1)))))
         MATLAB.put_variable(session, :A, input.A)
 
-        MATLAB.eval_string(session, "M = SSAI3(A, sz, fl)")
+        MATLAB.eval_string(session, "[M, generation_cost] = SSAI3(A, sz, fl)")
         M = MATLAB.get_mvariable(session, :M) |> MATLAB.jsparse
+        generation_work = MATLAB.get_variable(session, :generation_cost)
 
         function LinearOperator(y, r)
             mul!(y, M', r)
@@ -897,7 +917,7 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
         num_multiplications = nnz(M)
         
         println("Created Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).")
-        return Preconditioner(LinearOperator, num_multiplications, input)
+        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
     catch y
         println("Error creating the Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).")
         rethrow(y)
@@ -990,7 +1010,7 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
         num_multiplications = round(Int, ml.cycle_complexity(cycle=amg_cycle) * ml.levels[begin].A.nnz) * num_cycles
 
         println("Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
-        return Preconditioner(LinearOperator, num_multiplications, input)
+        return Preconditioner(LinearOperator, num_multiplications, Inf, input)
     catch y
         println("Error creating AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
         rethrow(y)
@@ -1085,11 +1105,80 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
         num_multiplications = round(Int, ml.cycle_complexity(cycle=amg_cycle) * ml.levels[begin].A.nnz) * num_cycles
 
         println("Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
-        return Preconditioner(LinearOperator, num_multiplications, input)
+        return Preconditioner(LinearOperator, num_multiplications, Inf, input)
     catch y
         println("Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
         rethrow(y)
     end
+end
+
+
+
+function LimitedLDL(input::problem_interface, memory::Integer, droptol::Real)
+    return LimitedLDL(input.Scaled, memory, droptol)
+end
+
+function LimitedLDL(input::package, memory::Integer, droptol::Real)
+
+    try
+        
+        ldl = LimitedLDLFactorizations.lldl(input.A; P = collect(1:size(input.A, 1)), 
+            memory = memory, droptol = droptol)
+
+        function LinearOperator(y, r)
+            y .= ldl \ r
+        end
+
+        num_multiplications = 2 * length(ldl.Lnzvals) + size(input.A, 1)
+
+        println("Created Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.")
+
+        generation_work = sum(x -> x^2, ldl.colptr[2:end] .- ldl.colptr[1:end-1])
+
+        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+
+    catch
+        println("Error creating Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.")
+        rethrow()
+    end
+end
+
+function RandomizedNystrom(input::problem_interface, rank::Integer, truncation::Integer, μ::Real)
+
+    @assert truncation ≤ rank "Truncation must be less than or equal to rank"
+
+    return RandomizedNystrom(input.Scaled, rank, truncation, μ)
+
+end
+
+function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, μ::Real)
+
+    @assert truncation ≤ rank "Truncation must be less than or equal to rank"
+
+    try
+        rny = RandomizedPreconditioners.NystromSketch(input.A, rank, truncation)
+
+        rnyinv = RandomizedPreconditioners.NystromPreconditionerInverse(rny, μ)
+
+        function LinearOperator(y, r)
+            mul!(y, rnyinv, r)
+        end
+
+        n = size(input.A, 1)
+
+        num_multiplications = 2*n*r + r
+
+        generation_cost = nnz(input.A) * rank + 3*n*r^2 + (r^3-3)/6 + (n+1)*r*(r-1)/2
+
+        println("Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation.")
+
+        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_cost), input)
+
+    catch e
+        println("Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation.")
+        rethrow(e)
+    end
+
 end
 
 

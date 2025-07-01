@@ -1,4 +1,4 @@
-function M = SSAI3(A,n,lfil)
+function [M, approx_work] = SSAI3(A,n,lfil)
 
 %        M = SSAI3(A,n,lfil);
 % constructs a SPAI-type preconditioner from SPD A.
@@ -23,6 +23,7 @@ function M = SSAI3(A,n,lfil)
 % 21 May 2020: Change the diag or sign of some m.
 
   M     = spalloc(n,n,lfil*n);
+  approx_work = 0;
   m0    = spalloc(n,1,lfil*2);   % Allow more than lfil just in case
   itmax = 2*lfil;
   tol   = 1e-3;
@@ -31,6 +32,8 @@ function M = SSAI3(A,n,lfil)
 
   Anorms = zeros(n,1);
   for j=1:n, Anorms(j) = norm(A(:,j))^2; end   % ||A(:,j)||^2
+
+  approx_work = approx_work + nnz(A(:,j));
 
   for j=1:n
      m    = m0;         % m = 0;  r = sparse(j,1,1,n,1);      (r = ej)
@@ -47,10 +50,12 @@ function M = SSAI3(A,n,lfil)
        % delta = full(delta);   % Assume A(i,i)=1
        % if delta<=tol, break, end
        delta = A(:,i)'*r / Anorms(i);
+       approx_work = approx_work + nnz(A(:,i)) + 1;
        delta = full(delta);
        m(i)  = m(i) + delta;
        if nnz(m)>=lfil, break; end
        r     = r - delta*A(:,i);
+       approx_work = approx_work + nnz(A(:,i));
        i1    = i;
        ri1   = r(i);
        r(i)  = 0;   % Don't select i next time around
@@ -64,6 +69,7 @@ function M = SSAI3(A,n,lfil)
 
   d = diag(M);           % sparse column vector
   M = (M+M')*0.5;
+  approx_work = approx_work + nnz(M);
   M = tril(M,-1);
   M = M + M' + diag(d);  % M is exactly symmetric
   fprintf('\n Negative diags: %8i', nneg )
