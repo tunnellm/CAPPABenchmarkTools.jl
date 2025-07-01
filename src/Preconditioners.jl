@@ -31,6 +31,7 @@ export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
 export LaplaceStripped # Laplacians.jl
 export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
+export RandomizedNystrom, LimitedLDL
  
 # Path to the dependencies directory, used for locating external scripts and data files.
 const DEP_DIR = joinpath(@__DIR__, "..", "DEPENDENCIES")
@@ -1124,7 +1125,7 @@ function LimitedLDL(input::package, memory::Integer, droptol::Real)
 
     nzpercol = nznum / size(input.A, 1)
 
-    memory_val = ceil(Int, nzpercol * memory)
+    memory_val = ceil(Int, nzpercol * memory) 
 
     try
         
