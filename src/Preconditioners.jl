@@ -1163,7 +1163,7 @@ function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, �
     @assert truncation ≤ rank "Truncation must be less than or equal to rank"
 
     try
-        rny = RandomizedPreconditioners.NystromSketch(input.A, rank, truncation)
+        rny = RandomizedPreconditioners.NystromSketch(input.A, truncation, rank)
 
         rnyinv = RandomizedPreconditioners.NystromPreconditionerInverse(rny, μ)
 

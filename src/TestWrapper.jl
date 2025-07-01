@@ -188,6 +188,7 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
         end
         if cg_iters > 0 && mr_iters > 0
             println("Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
+            run_conjugate_gradient && mkpath(joinpath(cg_location, output_filename))
             run_conjugate_gradient && do_log(joinpath(cg_location, output_filename, "log.txt"), "Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
             run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), "Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
             continue
@@ -201,6 +202,7 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
         catch e
             # println(e)
             println("Error in preconditioner $(string(preconditioner)) for $(matrix.name), $(matrix.name)")
+            run_conjugate_gradient && mkpath(joinpath(cg_location, output_filename))
             run_conjugate_gradient && do_log(joinpath(cg_location, output_filename, "log.txt"), e)
             run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), e)
             continue
