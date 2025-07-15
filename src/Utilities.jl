@@ -66,7 +66,7 @@ Represents a numerical linear system along with associated metadata for solving 
 - `name::String`: A descriptive name for the problem instance.
 - `norms::norm_information`: Precomputed norm information for `A`, including spectral, Frobenius, and infinity norms.
 - `diagonally_dominant::Bool`: Indicates whether `A` is diagonally dominant.
-- `nullspace::Int64`: The dimension of the null space, relevant for singular or near-singular problems.
+- `nullspace::Int64`: The location of the removed degree of freedom in Laplacian and SPD problems, or `0` if not applicable.
 
 # Notes
 - This struct is primarily used in preconditioned iterative solvers.
