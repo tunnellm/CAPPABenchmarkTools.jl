@@ -14,7 +14,8 @@ using LDLFactorizations
 import RandomizedPreconditioners
 import LimitedLDLFactorizations
 
-import PyCall
+import CondaPkg
+import PythonCall
 import MATLAB
 
 using CSV
@@ -647,10 +648,11 @@ function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering
     if fill < 1 || fill > 10
         throw(ArgumentError("Fill must be between 1 and 10"))
     end
-    scipy = PyCall.pyimport_conda("scipy.sparse", "scipy")
+    CondaPkg.add("scipy")
+    scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
     A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
-    dc = PyCall.pybuiltin("dict")
+    dc = PythonCall.pybuiltins.dict
     ilu = scipy.linalg.spilu(A, fill_factor=fill, drop_tol=drop_tolerance, 
         # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
         options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm=ordering,
@@ -729,10 +731,11 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     if fill < 1 || fill > 10
         throw(ArgumentError("Fill must be between 1 and 10"))
     end
-    scipy = PyCall.pyimport_conda("scipy.sparse", "scipy")
+    CondaPkg.add("scipy")
+    scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
     A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
-    dc = PyCall.pybuiltin("dict")
+    dc = PythonCall.pybuiltins.dict
     ilu = scipy.linalg.spilu(A, fill_factor=fill, drop_tol=drop_tolerance, 
         # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
         options=dc(
@@ -997,8 +1000,13 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
     try
         amg_cycle = string(amg_cycle)
 
-        sp = PyCall.pyimport_conda("scipy.sparse", "scipy")
-        amg = PyCall.pyimport_conda("pyamg", "pyamg")
+        CondaPkg.add("scipy")
+        CondaPkg.add("PyAMG")
+
+        sp = PythonCall.pyimport("scipy.sparse")
+        amg = PythonCall.pyimport("pyamg")
+
+        println("this is new one")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
         A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
@@ -1008,7 +1016,8 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
         function LinearOperator(y, x)
             y .= ml.solve(x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16)
         end
-        num_multiplications = round(Int, ml.cycle_complexity(cycle=amg_cycle) * ml.levels[begin].A.nnz) * num_cycles
+        
+        num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
 
         println("Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
         return Preconditioner(LinearOperator, num_multiplications, Inf, input)
@@ -1091,8 +1100,11 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
     try
         amg_cycle = string(amg_cycle)
 
-        sp = PyCall.pyimport_conda("scipy.sparse", "scipy")
-        amg = PyCall.pyimport_conda("pyamg", "pyamg")
+        CondaPkg.add("scipy")
+        CondaPkg.add("pyamg")
+
+        sp = PythonCall.pyimport("scipy.sparse")
+        amg = PythonCall.pyimport("pyamg")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
         A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
@@ -1103,7 +1115,7 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
             y .= ml.solve(x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16)
         end
 
-        num_multiplications = round(Int, ml.cycle_complexity(cycle=amg_cycle) * ml.levels[begin].A.nnz) * num_cycles
+        num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
 
         println("Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
         return Preconditioner(LinearOperator, num_multiplications, Inf, input)
