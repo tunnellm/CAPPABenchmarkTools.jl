@@ -912,7 +912,9 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
 
         MATLAB.eval_string(session, "[M, generation_cost] = SSAI3(A, sz, fl)")
         M = MATLAB.get_mvariable(session, :M) |> MATLAB.jsparse
-        generation_work = MATLAB.get_variable(session, :generation_cost)
+        generation_work = MATLAB.get_mvariable(session, :generation_cost) |> MATLAB.jscalar
+
+        println(generation_work)
 
         function LinearOperator(y, r)
             mul!(y, M', r)
