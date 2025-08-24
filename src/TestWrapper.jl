@@ -157,8 +157,8 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
         mkpath(mr_location * "Control/")
     end
 
-    control_iters_cg = 10 * matrix_size
-    control_iters_mr = 10 * matrix_size
+    control_iters_cg = 100 * matrix_size
+    control_iters_mr = 100 * matrix_size
 
     cg_control_work = check_previous(cg_location, "Control/", true) * nnz(matrix.Scaled.A)
     mr_control_work = check_previous(mr_location, "Control/", true) * nnz(matrix.Scaled.A)
