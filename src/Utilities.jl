@@ -129,9 +129,10 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
                 write(f, "\n")
             end
             return -1
+        finally
+            close(stream)
+            close(io)
         end
-        close(stream)
-        close(io)
     end
 
     convergence_data = ["relative_residual.csv"]  # we can check the other metrics but largely converge at a rate much faster than the relative residual
