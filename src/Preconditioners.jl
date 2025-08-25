@@ -760,8 +760,9 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     U_ = ilu.U
     L_ = ilu.L
 
-    U = SparseMatrixCSC(U_.shape..., U_.indptr .+ 1, U_.indices .+ 1, U_.data);
-    L = SparseMatrixCSC(L_.shape..., L_.indptr .+ 1, L_.indices .+ 1, L_.data);
+    U = SparseMatrixCSC(PythonCall.pyconvert(Tuple{Int64, Int64}, U_.shape)..., PythonCall.pyconvert(Vector{Int64}, U_.indptr) .+ 1, PythonCall.pyconvert(Vector{Int64}, U_.indices) .+ 1, PythonCall.pyconvert(Vector{Float64}, U_.data));
+
+    L = SparseMatrixCSC(PythonCall.pyconvert(Tuple{Int64, Int64}, L_.shape)..., PythonCall.pyconvert(Vector{Int64}, L_.indptr) .+ 1, PythonCall.pyconvert(Vector{Int64}, L_.indices) .+ 1, PythonCall.pyconvert(Vector{Float64}, L_.data));
 
     # We can use U too, but L appears to work better in practice.
     # To use U, we need to remove half of the scaling.
@@ -775,7 +776,7 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     function LinearOperator(y, r)  # recall we use the transpose here
         y .= sparse_triangular_solve(copy(L'), copy(L), r)
     end
-    num_multiplications = 2 * ilu.U.nnz
+    num_multiplications = 2 * PythonCall.pyconvert(Int64, ilu.U.nnz)
 
     generation_work = sum(x -> x, (L.colptr[2:end] .- L.colptr[1:end-1]) .* (U.colptr[2:end] .- U.colptr[1:end-1]))
 
@@ -1389,7 +1390,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer)
         y .= solver(r)
     end
 
-    return Preconditioner(LinearOperator, num_mult_list[1], input)
+    return Preconditioner(LinearOperator, num_mult_list[1], Inf, input)
 
 end
 
@@ -1430,7 +1431,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
 
     num_multiplications = sum(num_mult_list)
 
-    return Preconditioner(LinearOperator, num_multiplications, run_on)
+    return Preconditioner(LinearOperator, num_multiplications, Inf, run_on)
 end
 
 
@@ -1588,7 +1589,7 @@ function CombinatorialMG(mat::package)
             y .= pfunc(r)
         end
 
-        return Preconditioner(LinearOperator, num_multiplications, mat)
+        return Preconditioner(LinearOperator, num_multiplications, Inf, mat)
         
     catch y
         println("Error creating Combinatorial Multigrid Preconditioner for $(mat.name).")
@@ -1630,7 +1631,7 @@ function CombinatorialMG(input::package, run_on::package)
 
         end
 
-        return Preconditioner(LinearOperator, num_multiplications, run_on)
+        return Preconditioner(LinearOperator, num_multiplications, Inf, run_on)
 
 
     catch y
@@ -1651,7 +1652,7 @@ function _Control(input::package)
     end
     num_multiplications = 0
     println("Created Control Preconditioner for $(input.name).")
-    return Preconditioner(LinearOperator, num_multiplications, input)
+    return Preconditioner(LinearOperator, num_multiplications, 0., input)
 end
 
 end
