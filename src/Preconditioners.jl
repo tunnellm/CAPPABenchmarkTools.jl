@@ -33,6 +33,7 @@ export LaplaceStripped # Laplacians.jl
 export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
 export RandomizedNystrom, LimitedLDL
+export conda_install_dependencies
  
 # Path to the dependencies directory, used for locating external scripts and data files.
 const DEP_DIR = joinpath(@__DIR__, "..", "DEPENDENCIES")
@@ -59,6 +60,11 @@ struct Preconditioner
     num_multiplications::UInt64
     generation_work::Float64
     system::package
+end
+
+function conda_install_dependencies()
+    CondaPkg.add("scipy")
+    CondaPkg.add("PyAMG")
 end
 
 """
@@ -648,7 +654,7 @@ function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering
     if fill < 1 || fill > 10
         throw(ArgumentError("Fill must be between 1 and 10"))
     end
-    CondaPkg.add("scipy")
+    
     scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
     A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
@@ -731,7 +737,7 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     if fill < 1 || fill > 10
         throw(ArgumentError("Fill must be between 1 and 10"))
     end
-    CondaPkg.add("scipy")
+
     scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
     A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
@@ -1002,9 +1008,6 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
     try
         amg_cycle = string(amg_cycle)
 
-        CondaPkg.add("scipy")
-        CondaPkg.add("PyAMG")
-
         sp = PythonCall.pyimport("scipy.sparse")
         amg = PythonCall.pyimport("pyamg")
 
@@ -1101,9 +1104,6 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
 
     try
         amg_cycle = string(amg_cycle)
-
-        CondaPkg.add("scipy")
-        CondaPkg.add("pyamg")
 
         sp = PythonCall.pyimport("scipy.sparse")
         amg = PythonCall.pyimport("pyamg")
