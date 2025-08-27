@@ -239,7 +239,7 @@ function compute_operator_norms(A::SparseMatrixCSC)
 
     D = diag(A) |> D -> 1 ./ sqrt.(D) |> D -> Diagonal(D)
 
-    J = A
+    J = copy(A)
     foreach(i -> J[i, i] = 0.0, 1:n)
     J = D * A
     J = J * D
@@ -644,7 +644,7 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         A_Unscaler = A_Unscaler |> spdiagm
         A_Scaled = A_Scaler * A_Scaled
     end
-    
+
 
     A_Scaled_SDD = true
     for i in axes(A_Scaled, 2)
