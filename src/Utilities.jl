@@ -233,7 +233,7 @@ function compute_operator_norms(A::SparseMatrixCSC)
 
     p = n > 10^8 ? 125 : n > 2.5*10^7 ? 250 : n > 10^7 ? 400 : n > 2.5 * 10^6 ? 600 : n > 10^6 ? 550 : n > 500000 ? 500 : n > 250000 ? 400 : n > 100000 ? 300 : n > 50000 ? 200 : 100
 
-    spectral_norm::Float64 = symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1];
+    spectral_norm::Float64 = symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol=1e-6, ncv = p).values[1];
     infinity_norm::Float64 = maximum(sum(abs.(A), dims=1));
     frobenius_norm::Float64 = sqrt(sum(x -> x^2, A.nzval));
 
@@ -245,7 +245,7 @@ function compute_operator_norms(A::SparseMatrixCSC)
     J = J * D
     # this is the spectral radius of the Jacobi iteration matrix when A is SPD only
     # going to need to rewrite this for non-SPD matrices
-    jacobian_norm::Float64 = symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol=1e-8, ncv = p).values[1] 
+    jacobian_norm::Float64 = symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol=1e-6, ncv = p).values[1] 
 
     return norm_information(spectral_norm, infinity_norm, frobenius_norm, jacobian_norm)
 
@@ -309,7 +309,7 @@ function load_graph(filename::String, reordering::String)
     println("Loading $(filename)")
 
     base = "./graphs/"
-    norms_exists = isfile(base * filename * "/" * reordering * "_scaled_norm.csv") && isfile(base * filename * "/" * reordering * "_unscaled_norm.csv") && isfile(base * filename * "/" * reordering * "_laplacian_norm.csv")
+    norms_exists = isfile(base * filename * "/scaled_norm.csv") && isfile(base * filename * "/unscaled_norm.csv") && isfile(base * filename * "/laplacian_norm.csv")
 
     filename_stripped = ""
 
@@ -450,19 +450,19 @@ function load_graph(filename::String, reordering::String)
         unscaled_norms = compute_operator_norms(SPD_Laplacian)
         laplacian_norms = compute_operator_norms(Laplacian)
         
-        open(base * filename * "/" * reordering * "_unscaled_norm.csv", "w") do f
+        open(base * filename * "/unscaled_norm.csv", "w") do f
             write(f, "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)")
         end
-        open(base * filename * "/" * reordering * "_scaled_norm.csv", "w") do f
+        open(base * filename * "/scaled_norm.csv", "w") do f
             write(f, "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)")
         end
-        open(base * filename * "/" * reordering * "_laplacian_norm.csv", "w") do f
+        open(base * filename * "/laplacian_norm.csv", "w") do f
             write(f, "$(laplacian_norms.spectral_norm),$(laplacian_norms.infinity_norm),$(laplacian_norms.frobenius_norm),$(laplacian_norms.jacobian)")
         end
 
     else  # Load norms from file
         println("Loading scaled norms for $(filename)")
-        file = open(base * filename * "/" * reordering * "_scaled_norm.csv", "r")
+        file = open(base * filename * "/scaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
@@ -470,7 +470,7 @@ function load_graph(filename::String, reordering::String)
         scaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
         
         println("Loading unscaled norms for $(filename)")
-        file = open(base * filename * "/" * reordering * "_unscaled_norm.csv", "r")
+        file = open(base * filename * "/unscaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
@@ -478,7 +478,7 @@ function load_graph(filename::String, reordering::String)
         unscaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
 
         println("Loading Laplacian norms for $(filename)")
-        file = open(base * filename * "/" * reordering * "_laplacian_norm.csv", "r")
+        file = open(base * filename * "/laplacian_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
@@ -562,7 +562,7 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
     println("Loading $(filename)")
 
     base = "./matrices/"
-    norms_exists = isfile(base * filename * "/" * reordering * "_scaled_norm.csv") && isfile(base * filename * "/" * reordering * "_unscaled_norm.csv")
+    norms_exists = isfile(base * filename * "/scaled_norm.csv") && isfile(base * filename * "/unscaled_norm.csv")
 
     filename_stripped = ""
 
@@ -683,27 +683,27 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         println("Computing scaled norms")
         scaled_norms = compute_operator_norms(A_Scaled)
 
-        open(base * filename * "/" * reordering * "_scaled_norm.csv", "w") do f
+        open(base * filename * "/scaled_norm.csv", "w") do f
             write(f, "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)")
         end
 
         unscaled_norms = compute_operator_norms(A_)
 
-        open(base * filename * "/" * reordering * "_unscaled_norm.csv", "w") do f
+        open(base * filename * "/unscaled_norm.csv", "w") do f
             write(f, "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)")
         end
 
 
     else  # Load norms from file
         println("Loading norms for $(filename)")
-        file = open(base * filename * "/" * reordering * "_scaled_norm.csv", "r")
+        file = open(base * filename * "/scaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
 
         scaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
 
-        file = open(base * filename * "/" * reordering * "_unscaled_norm.csv", "r")
+        file = open(base * filename * "/unscaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
