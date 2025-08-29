@@ -1020,7 +1020,7 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
         ml = amg.ruge_stuben_solver(A)
         temp = np.zeros(size(input.A, 1))
         function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyVector(ml.solve(PythonCall.PyVector(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
+            y .= PythonCall.PyArray(ml.solve(PythonCall.PyArray(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
         end
         
         num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
@@ -1117,7 +1117,7 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
         
         temp = np.zeros(size(input.A, 1))
         function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyVector(ml.solve(PythonCall.PyVector(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
+            y .= PythonCall.PyArray(ml.solve(PythonCall.PyArray(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
         end
 
         num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
