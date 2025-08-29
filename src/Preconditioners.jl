@@ -63,6 +63,7 @@ struct Preconditioner
 end
 
 function conda_install_dependencies()
+    CondaPkg.add("numpy")
     CondaPkg.add("scipy")
     CondaPkg.add("PyAMG")
 end
@@ -1011,16 +1012,15 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
 
         sp = PythonCall.pyimport("scipy.sparse")
         amg = PythonCall.pyimport("pyamg")
-
-        println("this is new one")
+        np = PythonCall.pyimport("numpy")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
         A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
 
         ml = amg.ruge_stuben_solver(A)
-
-        function LinearOperator(y, x)
-            y .= ml.solve(x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16)
+        temp = np.zeros(size(input.A, 1))
+        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
+            y .= PythonCall.PyVector(ml.solve(PythonCall.PyVector(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
         end
         
         num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
@@ -1108,14 +1108,16 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
 
         sp = PythonCall.pyimport("scipy.sparse")
         amg = PythonCall.pyimport("pyamg")
+        np = PythonCall.pyimport("numpy")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
         A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
 
         ml = amg.smoothed_aggregation_solver(A)
-
-        function LinearOperator(y, x)
-            y .= ml.solve(x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16)
+        
+        temp = np.zeros(size(input.A, 1))
+        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
+            y .= PythonCall.PyVector(ml.solve(PythonCall.PyVector(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
         end
 
         num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
