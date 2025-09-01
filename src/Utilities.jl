@@ -115,6 +115,9 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
         stream = ZstdDecompressorStream(io)
         try
             df = CSV.read(stream, DataFrames.DataFrame)
+            if nrow(df) <= 0
+                return -1
+            end
             if (df[end, " Base Cost"] + df[end, " Preconditioner Cost"]) > control_work
                 # return check_previous(path, preconditioner_name, true)
                 return size(df, 1) - 1
@@ -160,17 +163,42 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
 end
 
 """
-    do_log(location::String, error_message::String)
+    do_log(location::String, msg::AbstractString)
 
-Appends an error message to a log file at the specified location, including a timestamp.
+Appends a plain string message to the log file at `location`, 
+preceded by a timestamp.
 """
-function do_log(location, error_message)
+function do_log(location::String, msg::AbstractString)
     open(location, "a") do f
-        write(f, "$(time())\n")
-        write(f, error_message)
-        write(f, "\n")
+        write(f, string(time(), "\n"))
+        write(f, msg, "\n\n")
     end
 end
+
+"""
+    do_log(location::String, err::Exception)
+
+Appends an exception report to the log file at `location`, 
+preceded by a timestamp. Includes the full error message and stacktrace.
+"""
+function do_log(location::String, err::Exception)
+    open(location, "a") do f
+        write(f, string(time(), "\n"))
+        showerror(f, err, catch_backtrace())
+        write(f, "\n\n")
+    end
+end
+
+"""
+    do_log(location::String, x)
+
+Fallback method. Converts `x` to a string and logs it as if it were a message.
+"""
+function do_log(location::String, x)
+    do_log(location, string(x))
+end
+
+
 
 
 """
