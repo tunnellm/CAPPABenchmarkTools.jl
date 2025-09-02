@@ -115,7 +115,7 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
         stream = ZstdDecompressorStream(io)
         try
             df = CSV.read(stream, DataFrames.DataFrame)
-            if nrow(df) <= 0
+            if DataFrames.nrow(df) <= 0
                 return -1
             end
             if (df[end, " Base Cost"] + df[end, " Preconditioner Cost"]) > control_work
