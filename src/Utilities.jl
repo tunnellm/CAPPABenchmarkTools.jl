@@ -11,6 +11,7 @@ using Random    # shuffle
 # Orderings
 import AMD
 import SymRCM
+import Metis
 
 # File I/O
 import CSV
@@ -49,7 +50,12 @@ struct norm_information
     infinity_norm::Float64
     frobenius_norm::Float64
     jacobian::Float64
-    function norm_information(spectral_norm::Float64, infinity_norm::Float64, frobenius_norm::Float64, jacobian::Float64)
+    function norm_information(
+        spectral_norm::Float64,
+        infinity_norm::Float64,
+        frobenius_norm::Float64,
+        jacobian::Float64,
+    )
         return new(spectral_norm, infinity_norm, frobenius_norm, jacobian)
     end
 end
@@ -108,7 +114,12 @@ Checks the previous convergence data for a given preconditioner to determine whe
 - If `check_tolerance` is enabled, the function verifies whether the minimum recorded tolerance meets the required threshold. If not met, it returns `-1`.
 - Otherwise, the function returns the highest iteration count recorded in the available convergence data.
 """
-function check_previous(path::String, preconditioner_name::String, check_tolerance::Bool; control_work = -1)
+function check_previous(
+    path::String,
+    preconditioner_name::String,
+    check_tolerance::Bool;
+    control_work = -1,
+)
 
     if control_work > 0 && isfile(path * preconditioner_name * "raw_data.csv.zstd")
         io = open(path * preconditioner_name * "raw_data.csv.zstd", "r")
@@ -122,7 +133,8 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
                 # return check_previous(path, preconditioner_name, true)
                 return size(df, 1) - 1
             else  # check for convergence, return iteration count if converged and -1 otherwise
-                return df[end, " Relative Residual"] <= minimum(tolerances) ? size(df, 1) - 1 : -1
+                return df[end, " Relative Residual"] <= minimum(tolerances) ?
+                       size(df, 1) - 1 : -1
             end
         catch e
             @warn "Error occurred while reading raw data: $e"
@@ -153,7 +165,8 @@ function check_previous(path::String, preconditioner_name::String, check_toleran
             if check_tolerance && min_value > minimum_tolerance
                 return -1
             else
-                maximum_iterations = maximum([maximum_iterations maximum(data[:, "Iteration"])])
+                maximum_iterations =
+                    maximum([maximum_iterations maximum(data[:, "Iteration"])])
             end
         else
             return -1
@@ -226,12 +239,22 @@ Computes relative tolerances for convergence analysis based on the residual norm
 - The normwise backward errors approximate how much `A` and `b` must be perturbed for `x` to be an exact solution.
 - `relative_normwise_2` is typically the most reliable measure, but `relative_normwise_i` and `relative_normwise_f` can be useful for structured problems.
 """
-function compute_tolerances(residual_norm::AbstractFloat, norm_b::AbstractFloat, norm_x::AbstractFloat, norms::norm_information)
+function compute_tolerances(
+    residual_norm::AbstractFloat,
+    norm_b::AbstractFloat,
+    norm_x::AbstractFloat,
+    norms::norm_information,
+)
     relative_residual = residual_norm / norm_b
     relative_normwise_2 = residual_norm / (norm_b + norms.spectral_norm * norm_x)
     relative_normwise_i = residual_norm / (norm_b + norms.infinity_norm * norm_x)
     relative_normwise_f = residual_norm / (norm_b + norms.frobenius_norm * norm_x)
-    return (relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f)
+    return (
+        relative_residual,
+        relative_normwise_2,
+        relative_normwise_i,
+        relative_normwise_f,
+    )
 end
 
 """
@@ -259,11 +282,18 @@ function compute_operator_norms(A::SparseMatrixCSC)
 
     n = size(A, 1)
 
-    p = n > 10^8 ? 125 : n > 2.5*10^7 ? 250 : n > 10^7 ? 400 : n > 2.5 * 10^6 ? 600 : n > 10^6 ? 550 : n > 500000 ? 500 : n > 250000 ? 400 : n > 100000 ? 300 : n > 50000 ? 200 : 100
+    p =
+        n > 10^8 ? 125 :
+        n > 2.5 * 10^7 ? 250 :
+        n > 10^7 ? 400 :
+        n > 2.5 * 10^6 ? 600 :
+        n > 10^6 ? 550 :
+        n > 500000 ? 500 : n > 250000 ? 400 : n > 100000 ? 300 : n > 50000 ? 200 : 100
 
-    spectral_norm::Float64 = symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol=1e-6, ncv = p).values[1];
-    infinity_norm::Float64 = maximum(sum(abs.(A), dims=1));
-    frobenius_norm::Float64 = sqrt(sum(x -> x^2, A.nzval));
+    spectral_norm::Float64 =
+        symeigs(A, 1; which = :LM, maxiter = div(n, 2), tol = 1e-6, ncv = p).values[1]
+    infinity_norm::Float64 = maximum(sum(abs.(A), dims = 1))
+    frobenius_norm::Float64 = sqrt(sum(x -> x^2, A.nzval))
 
     D = diag(A) |> D -> 1 ./ sqrt.(D) |> D -> Diagonal(D)
 
@@ -273,7 +303,8 @@ function compute_operator_norms(A::SparseMatrixCSC)
     J = J * D
     # this is the spectral radius of the Jacobi iteration matrix when A is SPD only
     # going to need to rewrite this for non-SPD matrices
-    jacobian_norm::Float64 = symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol=1e-6, ncv = p).values[1] 
+    jacobian_norm::Float64 =
+        symeigs(J, 1; which = :LM, maxiter = div(n, 2), tol = 1e-6, ncv = p).values[1]
 
     return norm_information(spectral_norm, infinity_norm, frobenius_norm, jacobian_norm)
 
@@ -312,7 +343,7 @@ Loads a graph from a Matrix Market file, processes its largest connected compone
 
 # Arguments
 - `filename::String`: Name of the graph file (without extension) located in the `./graphs/` directory.
-- `reordering::String`: Reordering scheme to apply to the Laplacian. Must be one of `"natural"`, `"rcm"`, or `"amd"`.
+- `reordering::String`: Reordering scheme to apply to the Laplacian. Must be one of `"natural"`, `"rcm"`, `"amd", or "metis"`.
 
 # Returns
 - `problem_interface`: A struct containing the original, scaled, and unscaled Laplacian matrices with metadata.
@@ -332,12 +363,15 @@ function load_graph(filename::String, reordering::String)
 
     reordering = lowercase(reordering)
 
-    @assert reordering ∈ ["natural", "rcm", "amd"]#, "dissection"] # "dissection" is not yet implemented
+    @assert reordering ∈ ["natural", "rcm", "amd", "metis"]#, "dissection"] # "dissection" is not yet implemented
 
     println("Loading $(filename)")
 
     base = "./graphs/"
-    norms_exists = isfile(base * filename * "/scaled_norm.csv") && isfile(base * filename * "/unscaled_norm.csv") && isfile(base * filename * "/laplacian_norm.csv")
+    norms_exists =
+        isfile(base * filename * "/scaled_norm.csv") &&
+        isfile(base * filename * "/unscaled_norm.csv") &&
+        isfile(base * filename * "/laplacian_norm.csv")
 
     filename_stripped = ""
 
@@ -355,7 +389,7 @@ function load_graph(filename::String, reordering::String)
 
     comps = vecToComps(co)
 
-    m, loc  = findmax(x -> length(x), comps)
+    m, loc = findmax(x -> length(x), comps)
 
     # Isolate the largest component
     Adjacency = Adjacency[comps[loc], comps[loc]]
@@ -368,7 +402,7 @@ function load_graph(filename::String, reordering::String)
     foreach(x -> Adjacency[x, x] = 0.0, 1:m)
 
     # Create the Laplacian matrix from the adjacency matrix
-    Degree = vec(sum(Adjacency, dims=2))
+    Degree = vec(sum(Adjacency, dims = 2))
     Laplacian = Diagonal(Degree) - Adjacency
 
     println("Loaded $(filename) into Julia")
@@ -383,18 +417,18 @@ function load_graph(filename::String, reordering::String)
         permutation = SymRCM.symrcm(Laplacian)
     elseif reordering == "amd"
         permutation = AMD.symamd(Laplacian)
-    elseif reordering == "dissection"
-        throw(ArgumentError("Dissection reordering has not been implemented yet."))
+    elseif reordering == "metrix"
+        permutation, _ = Metis.permutation(Laplacian)
     end
 
-    prolific = findmax(i -> Adjacency.colptr[i + 1] - Adjacency.colptr[i], 1:m)[2]
+    prolific = findmax(i -> Adjacency.colptr[i+1] - Adjacency.colptr[i], 1:m)[2]
 
     println("Computing Laplacian seed for $(filename)")
     seed = Vector{Float64}(undef, m)
 
     rng = StableRNG(123456789)
     # Not positive that we need to warm up the RNG but let's do it anyway.
-    for _ in 1:round(Int, log2(m))
+    for _ = 1:round(Int, log2(m))
         seed .= rand(rng, m)
     end
 
@@ -404,7 +438,7 @@ function load_graph(filename::String, reordering::String)
     # Find the indices of an even number of the largest elements in the seed
     amt = round(Int, log2(m))
     amt % 2 == 1 && (amt += 1)
-    max = partialsortperm(seed, 1:amt, rev=true)
+    max = partialsortperm(seed, 1:amt, rev = true)
 
     # Set exactly half of the seed to 1.0 and the other half to -1.0
     seed .= 0.0
@@ -426,10 +460,10 @@ function load_graph(filename::String, reordering::String)
 
     println("Most prolific node is at index $(prolific_reordered)")
 
-    SPD_Laplacian = Laplacian[1:m .!= prolific_reordered, 1:m .!= prolific_reordered]
-    SPD_RHS = L_RHS[1:m .!= prolific_reordered]
+    SPD_Laplacian = Laplacian[1:m.!=prolific_reordered, 1:m.!=prolific_reordered]
+    SPD_RHS = L_RHS[1:m.!=prolific_reordered]
 
-    SPD_Degree = Degree[1:m .!= prolific_reordered]
+    SPD_Degree = Degree[1:m.!=prolific_reordered]
 
     SPD_Scaler = Diagonal(1 ./ sqrt.(SPD_Degree))
 
@@ -440,7 +474,7 @@ function load_graph(filename::String, reordering::String)
 
     n = size(SPD_Laplacian_Scaled, 1)
 
-    for i in 1:n
+    for i = 1:n
 
         if 2 * SPD_Laplacian_Scaled[i, i] < sum(abs, view(SPD_Laplacian_Scaled, :, i))
             SPD_Laplacian_Scaled_SDD = false
@@ -448,11 +482,11 @@ function load_graph(filename::String, reordering::String)
         end
 
     end
-    
+
     SPD_RHS_Scaled = SPD_Scaler * SPD_RHS
 
     # The diagonal should already be 1.0, we set it here explicitly in case of floating point error.
-    foreach(x -> SPD_Laplacian_Scaled[x, x] = 1.0, 1:m - 1)
+    foreach(x -> SPD_Laplacian_Scaled[x, x] = 1.0, 1:m-1)
 
     println("Symmetrizing SPD Laplacian for $(filename)")
 
@@ -461,7 +495,7 @@ function load_graph(filename::String, reordering::String)
     SPD_Laplacian_Scaled.nzval .*= 0.5
     # We do not need to symmetrize the other unscaled matrices because we previously symmetrized the adjacency
 
-    SPD_Laplacian_seed = seed[1:m .!= prolific_reordered]
+    SPD_Laplacian_seed = seed[1:m.!=prolific_reordered]
     SPD_Laplacian_seed_scaled = Diagonal(sqrt.(SPD_Degree)) * SPD_Laplacian_seed
 
     println("Applied scaling and reordering to $(filename)")
@@ -477,15 +511,24 @@ function load_graph(filename::String, reordering::String)
         scaled_norms = compute_operator_norms(SPD_Laplacian_Scaled)
         unscaled_norms = compute_operator_norms(SPD_Laplacian)
         laplacian_norms = compute_operator_norms(Laplacian)
-        
+
         open(base * filename * "/unscaled_norm.csv", "w") do f
-            write(f, "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)")
+            write(
+                f,
+                "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)",
+            )
         end
         open(base * filename * "/scaled_norm.csv", "w") do f
-            write(f, "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)")
+            write(
+                f,
+                "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)",
+            )
         end
         open(base * filename * "/laplacian_norm.csv", "w") do f
-            write(f, "$(laplacian_norms.spectral_norm),$(laplacian_norms.infinity_norm),$(laplacian_norms.frobenius_norm),$(laplacian_norms.jacobian)")
+            write(
+                f,
+                "$(laplacian_norms.spectral_norm),$(laplacian_norms.infinity_norm),$(laplacian_norms.frobenius_norm),$(laplacian_norms.jacobian)",
+            )
         end
 
     else  # Load norms from file
@@ -495,15 +538,25 @@ function load_graph(filename::String, reordering::String)
         s, i, f, j = split(loaded, ",")
         close(file)
 
-        scaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
-        
+        scaled_norms = norm_information(
+            parse(Float64, s),
+            parse(Float64, i),
+            parse(Float64, f),
+            parse(Float64, j),
+        )
+
         println("Loading unscaled norms for $(filename)")
         file = open(base * filename * "/unscaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
 
-        unscaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
+        unscaled_norms = norm_information(
+            parse(Float64, s),
+            parse(Float64, i),
+            parse(Float64, f),
+            parse(Float64, j),
+        )
 
         println("Loading Laplacian norms for $(filename)")
         file = open(base * filename * "/laplacian_norm.csv", "r")
@@ -511,16 +564,45 @@ function load_graph(filename::String, reordering::String)
         s, i, f, j = split(loaded, ",")
         close(file)
 
-        laplacian_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
+        laplacian_norms = norm_information(
+            parse(Float64, s),
+            parse(Float64, i),
+            parse(Float64, f),
+            parse(Float64, j),
+        )
     end
-    
+
     return problem_interface(
-        package(Laplacian, L_RHS, seed, filename_stripped, laplacian_norms, true, prolific_reordered),
-        package(SPD_Laplacian_Scaled, SPD_RHS_Scaled, SPD_Laplacian_seed_scaled, filename_stripped, scaled_norms, SPD_Laplacian_Scaled_SDD, 0),
-        package(SPD_Laplacian, SPD_RHS, SPD_Laplacian_seed, filename_stripped, unscaled_norms, true, 0),
+        package(
+            Laplacian,
+            L_RHS,
+            seed,
+            filename_stripped,
+            laplacian_norms,
+            true,
+            prolific_reordered,
+        ),
+        package(
+            SPD_Laplacian_Scaled,
+            SPD_RHS_Scaled,
+            SPD_Laplacian_seed_scaled,
+            filename_stripped,
+            scaled_norms,
+            SPD_Laplacian_Scaled_SDD,
+            0,
+        ),
+        package(
+            SPD_Laplacian,
+            SPD_RHS,
+            SPD_Laplacian_seed,
+            filename_stripped,
+            unscaled_norms,
+            true,
+            0,
+        ),
         reordering,
         :symmetric_graph,
-        filename_stripped
+        filename_stripped,
     )
 
 end
@@ -549,7 +631,7 @@ Represents a structured problem instance with different representations of the s
 - The `reordering` field indicates whether node permutations were applied for better numerical properties.
 - The `type` field distinguishes between standard SPD matrices and graph-based problems.
 """
-struct problem_interface 
+struct problem_interface
     Original::package
     Scaled::package
     Special::package
@@ -581,16 +663,18 @@ Loads a sparse matrix from a Matrix Market file, applies reordering, and constru
 - A scaling transformation is applied for stability, and a padded variant is created if the system is not SDD.
 - Precomputed norm information is loaded if available; otherwise, norms are computed and stored.
 """
-function load_matrix(filename::String, reordering::String, SPD::Bool=true)
+function load_matrix(filename::String, reordering::String, SPD::Bool = true)
 
     reordering = lowercase(reordering)
 
-    @assert reordering ∈ ["natural", "rcm", "amd"] # "dissection" is not yet implemented
+    @assert reordering ∈ ["natural", "rcm", "amd", "metis"] # "dissection" is not yet implemented
 
     println("Loading $(filename)")
 
     base = "./matrices/"
-    norms_exists = isfile(base * filename * "/scaled_norm.csv") && isfile(base * filename * "/unscaled_norm.csv")
+    norms_exists =
+        isfile(base * filename * "/scaled_norm.csv") &&
+        isfile(base * filename * "/unscaled_norm.csv")
 
     filename_stripped = ""
 
@@ -610,18 +694,18 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
 
     rng = StableRNG(123456789)
     # Not positive that we need to warm up the RNG but let's do it anyway.
-    for _ in 1:round(Int, log2(m))
+    for _ = 1:round(Int, log2(m))
         seed .= rand(rng, m)
     end
 
-    max = partialsortperm(seed, 1:round(Int, log2(m) + 1), rev=true)
+    max = partialsortperm(seed, 1:round(Int, log2(m) + 1), rev = true)
 
     seed .= 0
 
-    seed[max] .= 1 .*(-1).^rand(rng, Bool, length(max))
+    seed[max] .= 1 .* (-1) .^ rand(rng, Bool, length(max))
 
     b = A_ * seed
-    
+
     if SPD
         A_ .= A_ + A_'
         A_.nzval .= 0.5 .* A_.nzval
@@ -637,6 +721,8 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         permutation = SymRCM.symrcm(A_ + A_')  # Some matrices are not symmetric at the bit level
     elseif reordering == "amd"
         permutation = AMD.symamd(A_)
+    elseif reordering == "metis"
+        permutation, _ = Metis.permutation(A_)
     end
 
     A_ = copy(A_[permutation, permutation])
@@ -660,7 +746,7 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         A_Scaler = 1.0 ./ A_Unscaler |> spdiagm
         A_Unscaler = A_Unscaler |> spdiagm
         A_Scaled = A_Scaler * A_Scaled * A_Scaler
-        for i in 1:m
+        for i = 1:m
             A_Scaled[i, i] = 1.0
         end
         A_Scaled .= A_Scaled + A_Scaled'
@@ -712,13 +798,19 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         scaled_norms = compute_operator_norms(A_Scaled)
 
         open(base * filename * "/scaled_norm.csv", "w") do f
-            write(f, "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)")
+            write(
+                f,
+                "$(scaled_norms.spectral_norm),$(scaled_norms.infinity_norm),$(scaled_norms.frobenius_norm),$(scaled_norms.jacobian)",
+            )
         end
 
         unscaled_norms = compute_operator_norms(A_)
 
         open(base * filename * "/unscaled_norm.csv", "w") do f
-            write(f, "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)")
+            write(
+                f,
+                "$(unscaled_norms.spectral_norm),$(unscaled_norms.infinity_norm),$(unscaled_norms.frobenius_norm),$(unscaled_norms.jacobian)",
+            )
         end
 
 
@@ -729,14 +821,24 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
         s, i, f, j = split(loaded, ",")
         close(file)
 
-        scaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
+        scaled_norms = norm_information(
+            parse(Float64, s),
+            parse(Float64, i),
+            parse(Float64, f),
+            parse(Float64, j),
+        )
 
         file = open(base * filename * "/unscaled_norm.csv", "r")
         loaded = readline(file)
         s, i, f, j = split(loaded, ",")
         close(file)
 
-        unscaled_norms = norm_information(parse(Float64, s), parse(Float64, i), parse(Float64, f), parse(Float64, j))
+        unscaled_norms = norm_information(
+            parse(Float64, s),
+            parse(Float64, i),
+            parse(Float64, f),
+            parse(Float64, j),
+        )
 
         close(file)
     end
@@ -747,17 +849,33 @@ function load_matrix(filename::String, reordering::String, SPD::Bool=true)
 
     seed .= seed[permutation]
     seed_scaled = A_Unscaler * seed
-    
+
     println("Loaded RHS for $(filename)")
 
     return problem_interface(
         package(A_, b, seed, filename_stripped, unscaled_norms, A_SDD, 0),
-        package(A_Scaled, b_scaled, seed_scaled, filename_stripped, scaled_norms, A_Scaled_SDD, 0),
-        package(A_Scaled_Padded, b_scaled, seed_scaled, filename_stripped, scaled_norms, true, 0),
+        package(
+            A_Scaled,
+            b_scaled,
+            seed_scaled,
+            filename_stripped,
+            scaled_norms,
+            A_Scaled_SDD,
+            0,
+        ),
+        package(
+            A_Scaled_Padded,
+            b_scaled,
+            seed_scaled,
+            filename_stripped,
+            scaled_norms,
+            true,
+            0,
+        ),
         reordering,
         :SPD_matrix,
-        filename_stripped
-        )
+        filename_stripped,
+    )
 end
 
 
@@ -776,13 +894,13 @@ Extracts the negative elements from the given sparse matrix `A`.
 - This function identifies and isolates negative values while preserving their original positions in the matrix.
 - The resulting matrix has zeros in place of all non-negative elements.
 """
-function extract_negative(A::SparseMatrixCSC{Tv, Ti})::SparseMatrixCSC{Tv, Ti} where {Tv, Ti}
+function extract_negative(A::SparseMatrixCSC{Tv,Ti})::SparseMatrixCSC{Tv,Ti} where {Tv,Ti}
 
     A = SparseMatrixCSC(A)
 
     m, n = size(A)
     rows, cols, vals = findnz(A)
-    
+
     neg_indices = findall(x -> x < 0, vals)
     neg_vals = vals[neg_indices]
     neg_rows = rows[neg_indices]
@@ -815,7 +933,10 @@ Constructs an augmented system from a symmetric diagonally dominant (SDD) matrix
     [ - (D2 / 2) - Ap      D1 + (D2 / 2) + An ]```
 - The augmented right-hand side is formed as `[b; -b]`, preserving solution consistency.
 """
-function make_augmented(A::SparseMatrixCSC{Tv, Ti}, b::Vector{Tv})::Tuple{SparseMatrixCSC{Tv, Ti}, Vector{Tv}} where {Tv, Ti}
+function make_augmented(
+    A::SparseMatrixCSC{Tv,Ti},
+    b::Vector{Tv},
+)::Tuple{SparseMatrixCSC{Tv,Ti},Vector{Tv}} where {Tv,Ti}
 
     A = SparseMatrixCSC(copy(A))
 
@@ -833,9 +954,9 @@ function make_augmented(A::SparseMatrixCSC{Tv, Ti}, b::Vector{Tv})::Tuple{Sparse
         end
     end
 
-    A = convert(SparseMatrixCSC{Float64, Int64}, A)
-    An = convert(SparseMatrixCSC{Float64, Int64}, An)
-    diagonal = convert(SparseMatrixCSC{Float64, Int64}, diagonal)
+    A = convert(SparseMatrixCSC{Float64,Int64}, A)
+    An = convert(SparseMatrixCSC{Float64,Int64}, An)
+    diagonal = convert(SparseMatrixCSC{Float64,Int64}, diagonal)
 
     Ap = A - An - diagonal
 
@@ -862,7 +983,7 @@ function make_augmented(A::SparseMatrixCSC{Tv, Ti}, b::Vector{Tv})::Tuple{Sparse
         end
     end
 
-    augmented_system = [(D1 + (D2 ./ 2) + An) (-(D2 ./ 2) - Ap);(-(D2 ./ 2) - Ap) (D1 + (D2 ./ 2) + An)]
+    augmented_system = [(D1+(D2./2)+An) (-(D2 ./ 2)-Ap); (-(D2 ./ 2)-Ap) (D1+(D2./2)+An)]
 
     augmented_b = [b; -b]
 
@@ -885,7 +1006,7 @@ Converts a Laplacian matrix `A` to its corresponding adjacency matrix.
 - This conversion assumes `A` is a valid Laplacian, meaning its diagonal entries represent node degrees, and off-diagonal entries represent negative edge weights.
 - The resulting adjacency matrix is symmetric and retains the sparsity pattern of `A`.
 """
-function laplace_to_adj(A::SparseMatrixCSC{Tv, Ti})::SparseMatrixCSC{Tv, Ti} where {Tv, Ti}
+function laplace_to_adj(A::SparseMatrixCSC{Tv,Ti})::SparseMatrixCSC{Tv,Ti} where {Tv,Ti}
 
     m, n = size(A)
 
@@ -917,19 +1038,19 @@ Checks whether the given sparse matrix `A` is a valid graph Laplacian.
   2. The row sums of `A` (negated) match the diagonal entries of `A`.
 - If any off-diagonal element is positive, the function returns `false`.
 """
-function is_laplacian(A::SparseMatrixCSC{Tv, Ti}) where {Tv, Ti}
+function is_laplacian(A::SparseMatrixCSC{Tv,Ti}) where {Tv,Ti}
 
-    diagonal = convert(SparseMatrixCSC{Tv, Ti}, diag(A) |> spdiagm)
+    diagonal = convert(SparseMatrixCSC{Tv,Ti}, diag(A) |> spdiagm)
 
     m, _ = size(A)
 
     B = A - diagonal
-    B = convert(SparseMatrixCSC{Tv, Ti}, B)
+    B = convert(SparseMatrixCSC{Tv,Ti}, B)
 
     e = ones(m)
     e = convert(Vector{Tv}, e)
 
-    D = -sum(B, dims=2)
+    D = -sum(B, dims = 2)
 
     # println(D .≈ diag(A))
 

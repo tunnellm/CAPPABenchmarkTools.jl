@@ -1,7 +1,8 @@
 module Preconditioners
 
 using ..Algorithms: sparse_triangular_solve
-using ..Utilities: norm_information, make_augmented, laplace_to_adj, problem_interface, package
+using ..Utilities:
+    norm_information, make_augmented, laplace_to_adj, problem_interface, package
 
 using SparseArrays
 using LinearAlgebra
@@ -20,6 +21,7 @@ import MATLAB
 
 using CSV
 using DataFrames
+using Random
 
 export Preconditioner  # Preconditioner
 export Control  # Identity
@@ -34,7 +36,7 @@ export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
 export RandomizedNystrom, LimitedLDL
 export conda_install_dependencies
- 
+
 # Path to the dependencies directory, used for locating external scripts and data files.
 const DEP_DIR = joinpath(@__DIR__, "..", "DEPENDENCIES")
 
@@ -112,10 +114,16 @@ Constructs a Successive Over-Relaxation (SOR) preconditioner for the given syste
 - The number of multiplications is estimated as `(nnz(A) + 2 * size(A, 1)) * num_iters`, accounting for all updates.
 """
 function SOR(input::package, ω::Float64, num_iters::Int64)
-    
-    ω = ω < 0. ? 1.0 + (Float64(input.norms.jacobian) / (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2)))^2 : ω
 
-    ψ = 1. - ω
+    ω =
+        ω < 0.0 ?
+        1.0 +
+        (
+            Float64(input.norms.jacobian) /
+            (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2))
+        )^2 : ω
+
+    ψ = 1.0 - ω
 
     matrix = input.A
 
@@ -127,13 +135,13 @@ function SOR(input::package, ω::Float64, num_iters::Int64)
 
     function LinearOperator(StartingGuess, b)
 
-        StartingGuess .= 0.
-        
-        for _ in 1:num_iters
-            for i in 1:sz
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+        StartingGuess .= 0.0
+
+        for _ = 1:num_iters
+            for i = 1:sz
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -146,8 +154,10 @@ function SOR(input::package, ω::Float64, num_iters::Int64)
         end
     end
     num_multiplications = (nnz(matrix) + 2 * sz) * num_iters
-    println("Created SOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    println(
+        "Created SOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.",
+    )
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -199,7 +209,7 @@ function SteepestDescent(input::package, num_iters::Int64)
     function LinearOperator(x, b)
         x .= 0
         r .= b
-        for _ in 1:num_iters-1
+        for _ = 1:num_iters-1
             mul!(p, input.A', r)
             α = (r' * r) / (p' * r)
             x .+= α .* r
@@ -210,11 +220,14 @@ function SteepestDescent(input::package, num_iters::Int64)
         x .+= α .* r
     end
 
-    num_multiplications = nnz(input.A) * num_iters + 4 * size(input.A, 1) * num_iters - size(input.A, 1)
+    num_multiplications =
+        nnz(input.A) * num_iters + 4 * size(input.A, 1) * num_iters - size(input.A, 1)
 
-    println("Created Steepest Descent Preconditioner for $(input.name) with $num_iters iterations.")
+    println(
+        "Created Steepest Descent Preconditioner for $(input.name) with $num_iters iterations.",
+    )
 
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -264,9 +277,15 @@ Constructs a Symmetric Successive Over-Relaxation (SSOR) preconditioner for the 
 """
 function SSOR(input::package, ω::Float64, num_iters::Int64)
 
-    ω = ω == -1. ? 1.0 + (Float64(input.norms.jacobian) / (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2)))^2 : ω
+    ω =
+        ω == -1.0 ?
+        1.0 +
+        (
+            Float64(input.norms.jacobian) /
+            (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2))
+        )^2 : ω
 
-    ψ = 1. - ω
+    ψ = 1.0 - ω
 
     matrix = input.A
 
@@ -275,14 +294,14 @@ function SSOR(input::package, ω::Float64, num_iters::Int64)
     colptr = matrix.colptr
     rowval = matrix.rowval
     nzval = matrix.nzval
-    
+
     function LinearOperator(StartingGuess, b)
         StartingGuess .= 0
-        @inbounds for _ in 1:num_iters
-            for i in 1:sz
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+        @inbounds for _ = 1:num_iters
+            for i = 1:sz
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -292,10 +311,10 @@ function SSOR(input::package, ω::Float64, num_iters::Int64)
                 end
                 StartingGuess[i] = ψ * StartingGuess[i] + (ω * (b[i] - row_sum)) / ii_val
             end
-            for i in sz:-1:1
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+            for i = sz:-1:1
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -308,8 +327,10 @@ function SSOR(input::package, ω::Float64, num_iters::Int64)
         end
     end
     num_multiplications = 2 * (nnz(matrix) + 2 * sz) * num_iters
-    println("Created SSOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    println(
+        "Created SSOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.",
+    )
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -367,12 +388,12 @@ function GaussSeidel(input::package, num_iters::Int64)
     nzval = matrix.nzval
 
     function LinearOperator(StartingGuess, b)
-        StartingGuess .= 0.
-        @inbounds  for _ in 1:num_iters
-            for i in 1:sz
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+        StartingGuess .= 0.0
+        @inbounds for _ = 1:num_iters
+            for i = 1:sz
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -380,13 +401,15 @@ function GaussSeidel(input::package, num_iters::Int64)
                         row_sum += nzval[j] * StartingGuess[idx]
                     end
                 end
-                StartingGuess[i] =  (b[i] - row_sum) / ii_val
+                StartingGuess[i] = (b[i] - row_sum) / ii_val
             end
         end
     end
     num_multiplications = nnz(matrix) * num_iters
-    println("Created Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    println(
+        "Created Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.",
+    )
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -442,14 +465,14 @@ function SymmetricGaussSeidel(input::package, num_iters::Int64)
     rowval = matrix.rowval
     nzval = matrix.nzval
 
-    sz = size(matrix, 1)    
+    sz = size(matrix, 1)
     function LinearOperator(StartingGuess, b)
-        StartingGuess .= 0.
-        @inbounds for _ in 1:num_iters
-            for i in 1:sz
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+        StartingGuess .= 0.0
+        @inbounds for _ = 1:num_iters
+            for i = 1:sz
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -459,10 +482,10 @@ function SymmetricGaussSeidel(input::package, num_iters::Int64)
                 end
                 StartingGuess[i] = (b[i] - row_sum) / ii_val
             end
-            for i in sz:-1:1
-                row_sum = 0.
-                ii_val = 0.
-                for j in colptr[i]:colptr[i+1]-1
+            for i = sz:-1:1
+                row_sum = 0.0
+                ii_val = 0.0
+                for j = colptr[i]:colptr[i+1]-1
                     idx = rowval[j]
                     if idx == i
                         ii_val = nzval[j]
@@ -475,8 +498,10 @@ function SymmetricGaussSeidel(input::package, num_iters::Int64)
         end
     end
     num_multiplications = 2 * nnz(matrix) * num_iters
-    println("Created Symmetric Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    println(
+        "Created Symmetric Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.",
+    )
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -500,7 +525,12 @@ Constructs an Incomplete Cholesky (IC) preconditioner using the scaled version o
 - The MIC variant is enabled when `michol` is set to `true`, modifying the factorization to improve numerical stability.
 - This function serves as a wrapper for calling the MATLAB-based Incomplete Cholesky implementation.
 """
-function IncompleteCholesky(mat::problem_interface, drop_tol::Float64, fill::Int64, michol::Bool=false)
+function IncompleteCholesky(
+    mat::problem_interface,
+    drop_tol::Float64,
+    fill::Int64,
+    michol::Bool = false,
+)
     return IncompleteCholesky(mat.Scaled, drop_tol, fill, michol)
 end
 
@@ -526,7 +556,12 @@ Constructs an Incomplete Cholesky (IC) preconditioner using MATLAB's `ichol` fun
 - The preconditioner applies a sparse triangular solve using `l` and `u`.
 - The function ensures that the MATLAB session is properly managed, closing it after execution.
 """
-function IncompleteCholesky(input::package, drop_tol::Float64, fill::Int64, michol::Bool=false)
+function IncompleteCholesky(
+    input::package,
+    drop_tol::Float64,
+    fill::Int64,
+    michol::Bool = false,
+)
 
     local session
     try
@@ -565,7 +600,12 @@ function IncompleteCholesky(input::package, drop_tol::Float64, fill::Int64, mich
         generation_work = sum(x -> x^2, u.colptr[2:end] .- u.colptr[1:end-1])
 
         println("Created Incomplete Cholesky Preconditioner for $(input.name).")
-        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(generation_work),
+            input,
+        )
     catch y
         println("Error creating the Incomplete Cholesky Preconditioner for $(input.name).")
         rethrow(y)
@@ -618,7 +658,12 @@ Constructs an incomplete LU (ILU) preconditioner using SuperLU, applied to the s
 - The function checks that `fill` is within the allowed range and throws an error otherwise.
 - The number of multiplications is estimated as the total number of nonzeros in the ILU factors.
 """
-function SuperILU(mat::problem_interface, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL")
+function SuperILU(
+    mat::problem_interface,
+    drop_tolerance::Float64,
+    fill::Int64,
+    ordering::String = "NATURAL",
+)
     return SuperILU(mat.Scaled, drop_tolerance, fill, ordering)
 end
 
@@ -645,7 +690,12 @@ Constructs an incomplete LU (ILU) preconditioner using SuperLU, applied to the g
 - The preconditioner solves systems using the SuperLU `ilu.solve` function.
 - The number of multiplications is estimated as the sum of nonzeros in `L` and `U`, capturing the factorization complexity.
 """
-function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL")
+function SuperILU(
+    input::package,
+    drop_tolerance::Float64,
+    fill::Int64,
+    ordering::String = "NATURAL",
+)
 
     ordering = uppercase(ordering)
 
@@ -655,19 +705,29 @@ function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering
     if fill < 1 || fill > 10
         throw(ArgumentError("Fill must be between 1 and 10"))
     end
-    
+
     scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
-    A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
+    A = scipy.csc_matrix(
+        (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
+        shape = size(input.A),
+    )
     dc = PythonCall.pybuiltins.dict
-    ilu = scipy.linalg.spilu(A, fill_factor=fill, drop_tol=drop_tolerance, 
+    ilu = scipy.linalg.spilu(
+        A,
+        fill_factor = fill,
+        drop_tol = drop_tolerance,
         # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
-        options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm=ordering,
-        # ColPerm="MMD_AT_PLUS_A",
-        # ColPerm="MMD_AT_PLUS_A",
-        # SymmetricMode=true,
-        DiagPivotThresh=0.)
-        )
+        options = dc(
+            Equil = false,
+            RowPerm = "NOROWPERM",
+            ColPerm = ordering,
+            # ColPerm="MMD_AT_PLUS_A",
+            # ColPerm="MMD_AT_PLUS_A",
+            # SymmetricMode=true,
+            DiagPivotThresh = 0.0,
+        ),
+    )
     function LinearOperator(y, r)
         y .= ilu.solve(r)
     end
@@ -675,10 +735,19 @@ function SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering
 
     # Estimate the generation work as the sum of nonzeros in L and U
     # This is a coarse approximation, as it does not account for thresholding effects.
-    generation_work = sum(x -> x, (ilu.L.colptr[2:end] .- ilu.L.colptr[1:end-1]) .* (ilu.U.colptr[2:end] .- ilu.U.colptr[1:end-1]))
-    
+    generation_work = sum(
+        x -> x,
+        (ilu.L.colptr[2:end] .- ilu.L.colptr[1:end-1]) .*
+        (ilu.U.colptr[2:end] .- ilu.U.colptr[1:end-1]),
+    )
+
     println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+    return Preconditioner(
+        LinearOperator,
+        num_multiplications,
+        Float64(generation_work),
+        input,
+    )
 end
 
 
@@ -702,7 +771,12 @@ Constructs an incomplete Cholesky-like factorization (`LLᵀ`) preconditioner us
 - The resulting factors are **not necessarily symmetric**, even if the input matrix is symmetric.
 - The function checks that `fill` is within the allowed range and throws an error otherwise.
 """
-function SuperLLT(mat::problem_interface, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL")
+function SuperLLT(
+    mat::problem_interface,
+    drop_tolerance::Float64,
+    fill::Int64,
+    ordering::String = "NATURAL",
+)
     return SuperLLT(mat.Scaled, drop_tolerance, fill, ordering)
 end
 
@@ -728,7 +802,12 @@ Constructs an incomplete Cholesky-like factorization (`LLᵀ`) preconditioner us
 - The preconditioner solves systems using a sparse triangular solve with `L'` and `L^T`.
 - The total number of multiplications is estimated as `2 * nnz(U)`, accounting for forward and backward solves.
 """
-function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL")
+function SuperLLT(
+    input::package,
+    drop_tolerance::Float64,
+    fill::Int64,
+    ordering::String = "NATURAL",
+)
 
     ordering = uppercase(ordering)
 
@@ -741,18 +820,25 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
 
     scipy = PythonCall.pyimport("scipy.sparse")
     # Convert the matrix to a python object
-    A = scipy.csc_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
+    A = scipy.csc_matrix(
+        (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
+        shape = size(input.A),
+    )
     dc = PythonCall.pybuiltins.dict
-    ilu = scipy.linalg.spilu(A, fill_factor=fill, drop_tol=drop_tolerance, 
+    ilu = scipy.linalg.spilu(
+        A,
+        fill_factor = fill,
+        drop_tol = drop_tolerance,
         # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
-        options=dc(
-            Equil=false,
-            RowPerm="NOROWPERM", 
-            ColPerm="NATURAL",
-        # ColPerm="MMD_AT_PLUS_A",
-        # ColPerm="MMD_AT_PLUS_A",
-        SymmetricMode=true,
-        DiagPivotThresh=0.)
+        options = dc(
+            Equil = false,
+            RowPerm = "NOROWPERM",
+            ColPerm = "NATURAL",
+            # ColPerm="MMD_AT_PLUS_A",
+            # ColPerm="MMD_AT_PLUS_A",
+            SymmetricMode = true,
+            DiagPivotThresh = 0.0,
+        ),
     )
 
     # lp = ilu.perm_r .+ 1
@@ -761,9 +847,19 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     U_ = ilu.U
     L_ = ilu.L
 
-    U = SparseMatrixCSC(PythonCall.pyconvert(Tuple{Int64, Int64}, U_.shape)..., PythonCall.pyconvert(Vector{Int64}, U_.indptr) .+ 1, PythonCall.pyconvert(Vector{Int64}, U_.indices) .+ 1, PythonCall.pyconvert(Vector{Float64}, U_.data));
+    U = SparseMatrixCSC(
+        PythonCall.pyconvert(Tuple{Int64,Int64}, U_.shape)...,
+        PythonCall.pyconvert(Vector{Int64}, U_.indptr) .+ 1,
+        PythonCall.pyconvert(Vector{Int64}, U_.indices) .+ 1,
+        PythonCall.pyconvert(Vector{Float64}, U_.data),
+    )
 
-    L = SparseMatrixCSC(PythonCall.pyconvert(Tuple{Int64, Int64}, L_.shape)..., PythonCall.pyconvert(Vector{Int64}, L_.indptr) .+ 1, PythonCall.pyconvert(Vector{Int64}, L_.indices) .+ 1, PythonCall.pyconvert(Vector{Float64}, L_.data));
+    L = SparseMatrixCSC(
+        PythonCall.pyconvert(Tuple{Int64,Int64}, L_.shape)...,
+        PythonCall.pyconvert(Vector{Int64}, L_.indptr) .+ 1,
+        PythonCall.pyconvert(Vector{Int64}, L_.indices) .+ 1,
+        PythonCall.pyconvert(Vector{Float64}, L_.data),
+    )
 
     # We can use U too, but L appears to work better in practice.
     # To use U, we need to remove half of the scaling.
@@ -779,10 +875,18 @@ function SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering
     end
     num_multiplications = 2 * PythonCall.pyconvert(Int64, ilu.U.nnz)
 
-    generation_work = sum(x -> x, (L.colptr[2:end] .- L.colptr[1:end-1]) .* (U.colptr[2:end] .- U.colptr[1:end-1]))
+    generation_work = sum(
+        x -> x,
+        (L.colptr[2:end] .- L.colptr[1:end-1]) .* (U.colptr[2:end] .- U.colptr[1:end-1]),
+    )
 
     println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+    return Preconditioner(
+        LinearOperator,
+        num_multiplications,
+        Float64(generation_work),
+        input,
+    )
 end
 
 
@@ -836,7 +940,9 @@ where `α` is chosen as `1/‖A‖` for stability.
 """
 function TruncatedNeumann(input::package, num_iters::Int64, norm_::Float64)
 
-    β = norm_ == -1.0 ? 0.5 * input.norms.spectral_norm : norm_ == 0.0 ? 1.0 : norm(input.A, norm_)
+    β =
+        norm_ == -1.0 ? 0.5 * input.norms.spectral_norm :
+        norm_ == 0.0 ? 1.0 : norm(input.A, norm_)
     α = 1.0 / β
 
     w = zeros(size(input.A, 1))
@@ -847,15 +953,17 @@ function TruncatedNeumann(input::package, num_iters::Int64, norm_::Float64)
     function LinearOperator(product, x)
         w .= x
         product .= w
-        for _ in 1:num_iters
+        for _ = 1:num_iters
             mul!(temp, matrix, product)
             product .= w .+ product .- temp
         end
         product .*= α
     end
     num_multiplications = num_iters * nnz(input.A)
-    println("Created Truncated Neumann Preconditioner for $(input.name) with $num_iters iterations.")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    println(
+        "Created Truncated Neumann Preconditioner for $(input.name) with $num_iters iterations.",
+    )
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 
@@ -901,7 +1009,7 @@ Constructs a Symmetric Sparse Approximate Inverse (SPAI) preconditioner using MA
 - The MATLAB session is managed internally, ensuring cleanup upon failure.
 """
 function SymmetricSPAI(input::package, fill_factor::Float64)
-    
+
     local session
     try
         session = MATLAB.MSession(0)
@@ -913,9 +1021,13 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
     try
 
         MATLAB.eval_string(session, "addpath(\"$(DEP_DIR)\")")
-        
+
         MATLAB.put_variable(session, :sz, Float64(size(input.A, 1)))
-        MATLAB.put_variable(session, :fl, ceil(fill_factor * Float64(ceil(nnz(input.A) / size(input.A, 1)))))
+        MATLAB.put_variable(
+            session,
+            :fl,
+            ceil(fill_factor * Float64(ceil(nnz(input.A) / size(input.A, 1)))),
+        )
         MATLAB.put_variable(session, :A, input.A)
 
         MATLAB.eval_string(session, "[M, generation_cost] = SSAI3(A, sz, fl)")
@@ -929,11 +1041,20 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
         end
 
         num_multiplications = nnz(M)
-        
-        println("Created Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).")
-        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+
+        println(
+            "Created Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).",
+        )
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(generation_work),
+            input,
+        )
     catch y
-        println("Error creating the Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).")
+        println(
+            "Error creating the Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).",
+        )
         rethrow(y)
     finally
         MATLAB.close(session)
@@ -1006,7 +1127,7 @@ Constructs an Algebraic Multigrid (AMG) preconditioner using the Ruge-Stuben met
 - If an error occurs, the function prints an error message and rethrows the exception.
 """
 function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
-    
+
     try
         amg_cycle = string(amg_cycle)
 
@@ -1015,20 +1136,40 @@ function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
         np = PythonCall.pyimport("numpy")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
+        A = sp.csr_matrix(
+            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
+            shape = size(input.A),
+        )
 
         ml = amg.ruge_stuben_solver(A)
         temp = np.zeros(size(input.A, 1))
         function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(ml.solve(PythonCall.PyArray(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
+            y .= PythonCall.PyArray(
+                ml.solve(
+                    PythonCall.PyArray(temp) .= x,
+                    maxiter = num_cycles,
+                    cycle = amg_cycle,
+                    tol = 1e-16,
+                ),
+            )
         end
-        
-        num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
 
-        println("Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
+        num_multiplications =
+            PythonCall.pyconvert(
+                Int64,
+                PythonCall.pybuiltins.round(
+                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
+                ),
+            ) * num_cycles
+
+        println(
+            "Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
+        )
         return Preconditioner(LinearOperator, num_multiplications, Inf, input)
     catch y
-        println("Error creating AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
+        println(
+            "Error creating AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
+        )
         rethrow(y)
     end
 
@@ -1053,7 +1194,11 @@ Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggreg
 - It is a wrapper around PyAMG's Smoothed Aggregation AMG implementation.
 - The preconditioner is constructed using PyAMG's `smoothed_aggregation_solver`, which generates a hierarchy of coarse grids for multigrid acceleration.
 """
-function AMG_smoothed_aggregation(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
+function AMG_smoothed_aggregation(
+    mat::problem_interface,
+    amg_cycle::Char,
+    num_cycles::Int64,
+)
     return AMG_smoothed_aggregation(mat, string(amg_cycle), num_cycles)
 end
 
@@ -1076,7 +1221,11 @@ Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggreg
 - It is a wrapper around PyAMG's Smoothed Aggregation AMG implementation.
 - The preconditioner is constructed using PyAMG's `smoothed_aggregation_solver`, which generates a hierarchy of coarse grids for multigrid acceleration.
 """
-function AMG_smoothed_aggregation(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
+function AMG_smoothed_aggregation(
+    mat::problem_interface,
+    amg_cycle::String,
+    num_cycles::Int64,
+)
     return AMG_smoothed_aggregation(mat.Scaled, string(amg_cycle), num_cycles)
 end
 
@@ -1111,21 +1260,41 @@ function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles:
         np = PythonCall.pyimport("numpy")
 
         # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix((input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1), shape=size(input.A))
+        A = sp.csr_matrix(
+            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
+            shape = size(input.A),
+        )
 
         ml = amg.smoothed_aggregation_solver(A)
-        
+
         temp = np.zeros(size(input.A, 1))
         function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(ml.solve(PythonCall.PyArray(temp) .= x, maxiter=num_cycles, cycle=amg_cycle, tol=1e-16))
+            y .= PythonCall.PyArray(
+                ml.solve(
+                    PythonCall.PyArray(temp) .= x,
+                    maxiter = num_cycles,
+                    cycle = amg_cycle,
+                    tol = 1e-16,
+                ),
+            )
         end
 
-        num_multiplications = PythonCall.pyconvert(Int64, PythonCall.pybuiltins.round(ml.cycle_complexity(cycle=amg_cycle) * ml.levels[0].A.nnz)) * num_cycles
+        num_multiplications =
+            PythonCall.pyconvert(
+                Int64,
+                PythonCall.pybuiltins.round(
+                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
+                ),
+            ) * num_cycles
 
-        println("Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
+        println(
+            "Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
+        )
         return Preconditioner(LinearOperator, num_multiplications, Inf, input)
     catch y
-        println("Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.")
+        println(
+            "Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
+        )
         rethrow(y)
     end
 end
@@ -1142,12 +1311,16 @@ function LimitedLDL(input::package, memory::Integer, droptol::Real)
 
     nzpercol = nznum / size(input.A, 1)
 
-    memory_val = ceil(Int, nzpercol * memory) 
+    memory_val = ceil(Int, nzpercol * memory)
 
     try
-        
-        ldl = LimitedLDLFactorizations.lldl(input.A; P = collect(1:size(input.A, 1)), 
-            memory = memory_val, droptol = droptol)
+
+        ldl = LimitedLDLFactorizations.lldl(
+            input.A;
+            P = collect(1:size(input.A, 1)),
+            memory = memory_val,
+            droptol = droptol,
+        )
 
         function LinearOperator(y, r)
             y .= ldl \ r
@@ -1155,31 +1328,55 @@ function LimitedLDL(input::package, memory::Integer, droptol::Real)
 
         num_multiplications = 2 * length(ldl.Lnzvals) + size(input.A, 1)
 
-        println("Created Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.")
+        println(
+            "Created Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
+        )
 
         generation_work = sum(x -> x^2, ldl.colptr[2:end] .- ldl.colptr[1:end-1])
 
-        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_work), input)
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(generation_work),
+            input,
+        )
 
     catch
-        println("Error creating Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.")
+        println(
+            "Error creating Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
+        )
         rethrow()
     end
 end
 
-function RandomizedNystrom(input::problem_interface, rank::Integer, truncation::Integer, μ::Real, dummy_variable::Int=0)
+function RandomizedNystrom(
+    input::problem_interface,
+    rank::Integer,
+    truncation::Integer,
+    μ::Real,
+    seed::Int = 123456789,
+)
 
     @assert truncation ≤ rank "Truncation must be less than or equal to rank"
 
-    return RandomizedNystrom(input.Scaled, rank, truncation, μ, dummy_variable)
+    return RandomizedNystrom(input.Scaled, rank, truncation, μ, seed)
 
 end
 
-function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, μ::Real, dummy_variable::Int=0)
+function RandomizedNystrom(
+    input::package,
+    rank::Integer,
+    truncation::Integer,
+    μ::Real,
+    seed::Int = 123456789,
+)
 
     @assert truncation ≤ rank "Truncation must be less than or equal to rank"
 
     try
+
+        Random.seed!(seed)
+
         rny = RandomizedPreconditioners.NystromSketch(input.A, truncation, rank)
 
         rnyinv = RandomizedPreconditioners.NystromPreconditionerInverse(rny, μ)
@@ -1190,16 +1387,29 @@ function RandomizedNystrom(input::package, rank::Integer, truncation::Integer, �
 
         n = size(input.A, 1)
 
-        num_multiplications = 2*n*truncation + truncation
+        num_multiplications = 2 * n * truncation + truncation
 
-        generation_cost = nnz(input.A) * rank + 3*n*rank^2 + (rank^3-3)/6 + (n+1)*rank*(rank-1)/2
+        generation_cost =
+            nnz(input.A) * rank +
+            3 * n * rank^2 +
+            (rank^3 - 3) / 6 +
+            (n + 1) * rank * (rank - 1) / 2
 
-        println("Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.")
+        println(
+            "Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.",
+        )
 
-        return Preconditioner(LinearOperator, num_multiplications, Float64(generation_cost), input)
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(generation_cost),
+            input,
+        )
 
     catch e
-        println("Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.")
+        println(
+            "Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.",
+        )
         rethrow(e)
     end
 
@@ -1232,7 +1442,7 @@ Computes an approximate Cholesky factorization for a Laplacian matrix, handling 
 - For single-component cases, the entire matrix is factored as one system.
 - If `fixedOrder` is `true`, a fixed ordering strategy is used for `Laplacians.LLMatOrd`.
 """
-function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
+function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false)
 
     # This function is derived from Laplacians.jl:
     # Copyright (c) 2015-2016 Daniel A. Spielman and other contributors.
@@ -1259,7 +1469,7 @@ function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
 
     local comps = Array{Array{Int,1}}(undef, 0)
     local solvers = Array{Function}(undef, 0)
-    local num_mult_list = Array{Int, 1}(undef, 0)
+    local num_mult_list = Array{Int,1}(undef, 0)
 
     co = Laplacians.components(a)
 
@@ -1279,7 +1489,7 @@ function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
 
         end
 
-        for i in start:length(comps)
+        for i = start:length(comps)
 
             ind = comps[i]
             asub = a[ind, ind]
@@ -1290,10 +1500,10 @@ function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
                 N = size(la_forced)[1]
 
                 ind_local = findmax(diag(la_forced))[2]
-                leave = [1:(ind_local-1);(ind_local+1):N]
+                leave = [1:(ind_local-1); (ind_local+1):N]
 
                 la_forced_sub = la_forced[leave, leave]
- 
+
                 ldli = cholesky(la_forced_sub)
 
                 push!(num_mult_list, 2 * nnz(sparse(ldli.L)))
@@ -1332,7 +1542,7 @@ function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
                 push!(solvers, b -> Laplacians.LDLsolver(ldli, b))
 
             end
-            
+
         end
 
     else
@@ -1341,26 +1551,28 @@ function getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
 
         if fixedOrder
             if split >= 1 && merge == split
-                llmat = Laplacians.LLMatOrd(a,split)
-                ldli = Laplacians.approxChol(llmat,split)
+                llmat = Laplacians.LLMatOrd(a, split)
+                ldli = Laplacians.approxChol(llmat, split)
             elseif split >= 1 && merge != split
-                println("Fixed-order solve with merge != split not implemented here. Abort.")
+                println(
+                    "Fixed-order solve with merge != split not implemented here. Abort.",
+                )
                 return 0, 0, true # bool error 
             else
                 llmat = Laplacians.LLMatOrd(a)
                 ldli = Laplacians.approxChol(llmat)
-            end 
+            end
         else
             if split >= 1 && merge < 1
                 llmat = Laplacians.LLmatp(a, split)
                 ldli = Laplacians.approxChol(llmat, split)
             elseif split >= 1 && merge >= 1
                 llmat = Laplacians.LLmatp(a, split)
-                ldli = Laplacians.approxChol(llmat,  split, merge)
+                ldli = Laplacians.approxChol(llmat, split, merge)
             else
                 llmat = Laplacians.LLmatp(a)
                 ldli = Laplacians.approxChol(llmat)
-            end 
+            end
         end
 
         subSolver(b) = Laplacians.LDLsolver(ldli, b)
@@ -1375,8 +1587,10 @@ end
 
 function LaplaceStripped(mat::problem_interface, split::Integer, merge::Integer)
     mat.type == :symmetric_graph && return LaplaceStripped(mat.Original, split, merge) # run on the Laplacian if undirected graph
-    mat.Scaled.diagonally_dominant && return LaplaceStripped(mat.Scaled, split, merge, mat.Scaled) # run augmented on scaled if SDD
-    mat.Original.diagonally_dominant && return LaplaceStripped(mat.Original, split, merge, mat.Original) # run augmented on original if SDD
+    mat.Scaled.diagonally_dominant &&
+        return LaplaceStripped(mat.Scaled, split, merge, mat.Scaled) # run augmented on scaled if SDD
+    mat.Original.diagonally_dominant &&
+        return LaplaceStripped(mat.Original, split, merge, mat.Original) # run augmented on original if SDD
     return LaplaceStripped(mat.Special, split, merge, mat.Scaled) # run augmented on padded, apply to scaled
 end
 
@@ -1404,7 +1618,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
     local sz = size(input.A, 1)
     local sol_ = zeros(size(A_aug_lap, 1))
     local rhs = zeros(size(A_aug_lap, 1))
-    
+
     a = laplace_to_adj(A_aug_lap)
 
     len, components, solvers, num_mult_list = getLapChol(a; split = split, merge = merge)
@@ -1419,7 +1633,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
         view(rhs, sz+1:length(rhs)) .= .-sol
 
         if len > 1
-            for i in 1:len
+            for i = 1:len
                 work_space[i] .= view(rhs, components[i])
                 sol_[components[i]] .= solvers[i](work_space[i])
             end
@@ -1428,7 +1642,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
         end
 
         sol .= (view(sol_, 1:sz) .- view(sol_, sz+1:length(sol_))) ./ 2
-        
+
     end
 
     num_multiplications = sum(num_mult_list)
@@ -1592,7 +1806,7 @@ function CombinatorialMG(mat::package)
         end
 
         return Preconditioner(LinearOperator, num_multiplications, Inf, mat)
-        
+
     catch y
         println("Error creating Combinatorial Multigrid Preconditioner for $(mat.name).")
         rethrow(y)
@@ -1601,7 +1815,7 @@ end
 
 
 function CombinatorialMG(input::package, run_on::package)
-    try 
+    try
         work_lookup = CSV.read(joinpath(DEP_DIR, "CombinatorialWorkCost.csv"), DataFrame)
 
         idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
@@ -1616,7 +1830,7 @@ function CombinatorialMG(input::package, run_on::package)
         pfunc, _ = CombinatorialMultigrid.cmg_preconditioner_lap(A_)
 
         sz = Integer(size(input.A, 1))
-        
+
         sol_ = zeros(size(A_, 1))
         rhs = zeros(size(A_, 1))
 
@@ -1654,7 +1868,7 @@ function _Control(input::package)
     end
     num_multiplications = 0
     println("Created Control Preconditioner for $(input.name).")
-    return Preconditioner(LinearOperator, num_multiplications, 0., input)
+    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
 end
 
 end
