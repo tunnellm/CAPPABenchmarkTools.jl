@@ -1396,7 +1396,7 @@ function RandomizedNystrom(
             (n + 1) * rank * (rank - 1) / 2
 
         println(
-            "Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.",
+            "Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, seeded with $seed.",
         )
 
         return Preconditioner(
@@ -1408,7 +1408,7 @@ function RandomizedNystrom(
 
     catch e
         println(
-            "Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, run $dummy_variable.",
+            "Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, seeded with $seed.",
         )
         rethrow(e)
     end
