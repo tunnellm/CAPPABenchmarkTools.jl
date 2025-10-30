@@ -60,7 +60,25 @@ Writes iteration metrics for the Preconditioned Conjugate Gradient (PCG) algorit
 - `b::Vector`: Right-hand side vector of the linear system.
 
 """
-function pcg_print(stream, i, relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f, error, base_cost, prec_cost, μ, r1, r1z1_new, pprod, np, Ax, x, b)
+function pcg_print(
+    stream,
+    i,
+    relative_residual,
+    relative_normwise_2,
+    relative_normwise_i,
+    relative_normwise_f,
+    error,
+    base_cost,
+    prec_cost,
+    μ,
+    r1,
+    r1z1_new,
+    pprod,
+    np,
+    Ax,
+    x,
+    b,
+)
 
     write(stream, string(i))
     write(stream, comma)
@@ -88,7 +106,7 @@ function pcg_print(stream, i, relative_residual, relative_normwise_2, relative_n
     write(stream, comma)
     write(stream, string(np))
     write(stream, comma)
-    write(stream, string(.5 * (x' * Ax) - x' * b))
+    write(stream, string(0.5 * (x' * Ax) - x' * b))
     write(stream, newline)
 
 end
@@ -124,8 +142,10 @@ Solves the linear system `Ax = b` using the Preconditioned Conjugate Gradient (P
 function preconditioned_conjugate_gradient(
     preconditioner::Preconditioner,
     maxiters::Int64,
-    raw_data_out::String, convergence_data_out::String; work_limit::Int64 = -1
-    )
+    raw_data_out::String,
+    convergence_data_out::String;
+    work_limit::Int64 = -1,
+)
 
     base_cost = nnz(preconditioner.system.A)
     prec_cost = preconditioner.num_multiplications
@@ -177,9 +197,24 @@ function preconditioned_conjugate_gradient(
 
     np = norm(p)
 
-    pcg_print(compressed_data_stream, 0, compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)..., norm(preconditioner.system.seed), base_cost, prec_cost, μ, r, rz_old, pprod, np, Ax, x, preconditioner.system.b)
+    pcg_print(
+        compressed_data_stream,
+        0,
+        compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)...,
+        norm(preconditioner.system.seed),
+        base_cost,
+        prec_cost,
+        μ,
+        r,
+        rz_old,
+        pprod,
+        np,
+        Ax,
+        x,
+        preconditioner.system.b,
+    )
 
-    for i in 1:maxiters
+    for i = 1:maxiters
 
         iter = i
 
@@ -193,7 +228,7 @@ function preconditioned_conjugate_gradient(
         end
         mul!(prod, preconditioner.system.A', p)
 
-        
+
 
         pprod = p' * prod
 
@@ -205,7 +240,7 @@ function preconditioned_conjugate_gradient(
 
         preconditioner.LinearOperator(z, r)
 
-        
+
 
         rz_old = rz_new
 
@@ -215,19 +250,43 @@ function preconditioned_conjugate_gradient(
             x_true .= x
         end
 
-        
+
 
         mul!(Ax, preconditioner.system.A', x_true)
 
         r_true .= preconditioner.system.b .- Ax
 
-        relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f = compute_tolerances(norm(r_true), norm_b, norm(x_true), preconditioner.system.norms)
+        relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f =
+            compute_tolerances(
+                norm(r_true),
+                norm_b,
+                norm(x_true),
+                preconditioner.system.norms,
+            )
 
         np = norm(p)
 
-        pcg_print(compressed_data_stream, i, relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f, norm(preconditioner.system.seed .- x_true), base_cost, prec_cost, μ, r, rz_new, pprod, np, Ax, x_true, preconditioner.system.b)
+        pcg_print(
+            compressed_data_stream,
+            i,
+            relative_residual,
+            relative_normwise_2,
+            relative_normwise_i,
+            relative_normwise_f,
+            norm(preconditioner.system.seed .- x_true),
+            base_cost,
+            prec_cost,
+            μ,
+            r,
+            rz_new,
+            pprod,
+            np,
+            Ax,
+            x_true,
+            preconditioner.system.b,
+        )
 
-        
+
         if isnan(μ)
             close(compressed_data_stream)
             close(raw_data_stream)
@@ -239,11 +298,14 @@ function preconditioned_conjugate_gradient(
             throw(ArgumentError("NaN Detected in Conjugate Gradient"))
         end
 
-        
+
         @label relres
         for tol in relative_residual_tolerances
             if relative_residual <= tol
-                deleteat!(relative_residual_tolerances, findfirst(x -> x == tol, relative_residual_tolerances))
+                deleteat!(
+                    relative_residual_tolerances,
+                    findfirst(x -> x == tol, relative_residual_tolerances),
+                )
                 write(relative_residual_out, string(i))
                 write(relative_residual_out, comma)
                 write(relative_residual_out, string(tol))
@@ -260,7 +322,10 @@ function preconditioned_conjugate_gradient(
         @label relnormwise2
         for tol in relative_normwise_2_tolerances
             if relative_normwise_2 <= tol
-                deleteat!(relative_normwise_2_tolerances, findfirst(x -> x == tol, relative_normwise_2_tolerances))
+                deleteat!(
+                    relative_normwise_2_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_2_tolerances),
+                )
                 write(relative_normwise_2_out, string(i))
                 write(relative_normwise_2_out, comma)
                 write(relative_normwise_2_out, string(tol))
@@ -277,7 +342,10 @@ function preconditioned_conjugate_gradient(
         @label relnormwisei
         for tol in relative_normwise_i_tolerances
             if relative_normwise_i <= tol
-                deleteat!(relative_normwise_i_tolerances, findfirst(x -> x == tol, relative_normwise_i_tolerances))
+                deleteat!(
+                    relative_normwise_i_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_i_tolerances),
+                )
                 write(relative_normwise_i_out, string(i))
                 write(relative_normwise_i_out, comma)
                 write(relative_normwise_i_out, string(tol))
@@ -294,7 +362,10 @@ function preconditioned_conjugate_gradient(
         @label relnormwisef
         for tol in relative_normwise_f_tolerances
             if relative_normwise_f <= tol
-                deleteat!(relative_normwise_f_tolerances, findfirst(x -> x == tol, relative_normwise_f_tolerances))
+                deleteat!(
+                    relative_normwise_f_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_f_tolerances),
+                )
                 write(relative_normwise_f_out, string(i))
                 write(relative_normwise_f_out, comma)
                 write(relative_normwise_f_out, string(tol))
@@ -309,7 +380,12 @@ function preconditioned_conjugate_gradient(
             end
         end
 
-        if (isempty(relative_residual_tolerances) && isempty(relative_normwise_2_tolerances) && isempty(relative_normwise_i_tolerances) && isempty(relative_normwise_f_tolerances))
+        if (
+            isempty(relative_residual_tolerances) &&
+            isempty(relative_normwise_2_tolerances) &&
+            isempty(relative_normwise_i_tolerances) &&
+            isempty(relative_normwise_f_tolerances)
+        )
             break
         end
 
@@ -392,7 +468,32 @@ Writes iteration metrics for the Preconditioned Minimal Residual (MINRES) algori
 - `base_cost` and `prec_cost` track computational costs per iteration.
 - The last value written corresponds to the objective function value `(1/2) x'Ax - x'b`.
 """
-function minres_print(stream, i, relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f, error, base_cost, prec_cost, phi, r1, r2y, beta, alfa, anorm, acond, dxnorm, rnorm, epsx, epsr, norm_w, Ax, x, b)
+function minres_print(
+    stream,
+    i,
+    relative_residual,
+    relative_normwise_2,
+    relative_normwise_i,
+    relative_normwise_f,
+    error,
+    base_cost,
+    prec_cost,
+    phi,
+    r1,
+    r2y,
+    beta,
+    alfa,
+    anorm,
+    acond,
+    dxnorm,
+    rnorm,
+    epsx,
+    epsr,
+    norm_w,
+    Ax,
+    x,
+    b,
+)
 
     write(stream, string(i))
     write(stream, comma)
@@ -434,7 +535,7 @@ function minres_print(stream, i, relative_residual, relative_normwise_2, relativ
     write(stream, comma)
     write(stream, string(norm_w))
     write(stream, comma)
-    write(stream, string(.5 * (x' * Ax) - x' * b))
+    write(stream, string(0.5 * (x' * Ax) - x' * b))
     write(stream, newline)
 
 end
@@ -472,8 +573,10 @@ Solves the linear system `Ax = b` using the Preconditioned Minimal Residual (MIN
 function preconditioned_minres(
     preconditioner::Preconditioner,
     maxiters::Int64,
-    raw_data_out::String, convergence_data_out::String; work_limit::Int64 = -1
-    )
+    raw_data_out::String,
+    convergence_data_out::String;
+    work_limit::Int64 = -1,
+)
 
     rtol = 1e-16
 
@@ -504,20 +607,18 @@ function preconditioned_minres(
     r0 = copy(preconditioner.system.b)
     bnorm = norm(preconditioner.system.b)
     rtol0 = copy(rtol)
-    rnorm = 0.
-    arnorm = 0.
-    anorm = 0.
-    acond = 0.
-    dxnorm = 0.
-    betacheck = 0.
+    rnorm = 0.0
+    arnorm = 0.0
+    anorm = 0.0
+    acond = 0.0
+    dxnorm = 0.0
     x = zeros(n)
     x_true = copy(x)
     r1 = copy(r0)
     y = zeros(n)
     preconditioner.LinearOperator(y, r0)
     beta1 = r0' * y
-    betacheck = beta1 / (r0' * r0)
-    if betacheck < 0.
+    if beta1 < 0.0
         close(compressed_data_stream)
         close(raw_data_stream)
         close(raw_data)
@@ -531,23 +632,23 @@ function preconditioned_minres(
     numrtol = 1
     beta1 = sqrt(beta1)
     istop = 0
-    oldb = 0.
+    oldb = 0.0
     beta = copy(beta1)
-    dbar = 0.
-    epsln = 0.
+    dbar = 0.0
+    epsln = 0.0
     phibar = copy(beta1)
     rhs1 = copy(beta1)
-    rhs2 = 0.
-    tnorm2 = 0.
-    cs = -1.
-    sn = 0.
-    gmax = 0.
+    rhs2 = 0.0
+    tnorm2 = 0.0
+    cs = -1.0
+    sn = 0.0
+    gmax = 0.0
     gmin = typemax(Float64)
     r2 = copy(r0)
     w = zeros(n)
     w1 = zeros(n)
     w2 = zeros(n)
-    x0norm = 0.
+    x0norm = 0.0
 
     iter = 0
 
@@ -556,9 +657,31 @@ function preconditioned_minres(
     r_true = zeros(n)
     Ax = zeros(n)
 
-    minres_print(compressed_data_stream, 0, compute_tolerances(norm(r0), bnorm, norm(x), preconditioner.system.norms)..., norm(preconditioner.system.seed), base_cost, prec_cost, 0., r0, r2' * y, beta, 0., 0., 0., 0., 0., 0., 0., 0., Ax, x, preconditioner.system.b)
+    minres_print(
+        compressed_data_stream,
+        0,
+        compute_tolerances(norm(r0), bnorm, norm(x), preconditioner.system.norms)...,
+        norm(preconditioner.system.seed),
+        base_cost,
+        prec_cost,
+        0.0,
+        r0,
+        r2' * y,
+        beta,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        Ax,
+        x,
+        preconditioner.system.b,
+    )
 
-    for i in 1:maxiters
+    for i = 1:maxiters
         s = 1 / beta
         v .= s .* y
         mul!(y, preconditioner.system.A', v)
@@ -574,10 +697,23 @@ function preconditioned_minres(
         preconditioner.LinearOperator(y, r2)
         oldb = copy(beta)
         beta = r2' * y
-        betacheck = beta / (r2' * r2)
 
         # Check if any of these things are NaN
-        if isnan(alfa) || isnan(beta) || isnan(betacheck) || isnan(epsln) || isnan(dbar) || isnan(phibar) || isnan(rhs1) || isnan(rhs2) || isnan(tnorm2) || isnan(arnorm) || isnan(anorm) || isnan(acond) || isnan(dxnorm) || isnan(rnorm) || isnan(gmax) || isnan(gmin)
+        if isnan(alfa) ||
+           isnan(beta) ||
+           isnan(epsln) ||
+           isnan(dbar) ||
+           isnan(phibar) ||
+           isnan(rhs1) ||
+           isnan(rhs2) ||
+           isnan(tnorm2) ||
+           isnan(arnorm) ||
+           isnan(anorm) ||
+           isnan(acond) ||
+           isnan(dxnorm) ||
+           isnan(rnorm) ||
+           isnan(gmax) ||
+           isnan(gmin)
             close(compressed_data_stream)
             close(raw_data_stream)
             close(raw_data)
@@ -588,7 +724,7 @@ function preconditioned_minres(
             throw(ArgumentError("NaN Detected in MINRES"))
         end
 
-        if preconditioner.num_multiplications != 0 && betacheck < 1e-6
+        if beta < 0
             close(compressed_data_stream)
             close(raw_data_stream)
             close(raw_data)
@@ -642,7 +778,7 @@ function preconditioned_minres(
 
         epsx = (anorm * dxnorm + beta1) * eps(1.0)
         epsr = (anorm * dxnorm + beta1) * rtol
-        
+
         # test1 = rnorm / (anorm * dxnorm + bnorm)
         # test2 = arnorm / (anorm * (rnorm + eps(1.0)))
         # t1 = 1 + test1
@@ -652,7 +788,7 @@ function preconditioned_minres(
         #     println("t2")
         #     istop = 2
         # end
-        
+
         # if t1 <= 1
         #     println("t1")
         #     istop = 1
@@ -713,48 +849,106 @@ function preconditioned_minres(
         end
 
         mul!(Ax, preconditioner.system.A', x_true)
-        r_true .= preconditioner.system.b .- Ax 
+        r_true .= preconditioner.system.b .- Ax
 
 
-        relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f = compute_tolerances(norm(r_true), bnorm, norm(x_true), preconditioner.system.norms)
+        relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f =
+            compute_tolerances(
+                norm(r_true),
+                bnorm,
+                norm(x_true),
+                preconditioner.system.norms,
+            )
 
-        minres_print(compressed_data_stream, i, relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f, norm(preconditioner.system.seed .- x_true), base_cost, prec_cost, phi, r1, r2' * y, beta, alfa, anorm, acond, dxnorm, rnorm, epsx, epsr, norm(w), Ax, x_true, preconditioner.system.b)
+        minres_print(
+            compressed_data_stream,
+            i,
+            relative_residual,
+            relative_normwise_2,
+            relative_normwise_i,
+            relative_normwise_f,
+            norm(preconditioner.system.seed .- x_true),
+            base_cost,
+            prec_cost,
+            phi,
+            r1,
+            r2' * y,
+            beta,
+            alfa,
+            anorm,
+            acond,
+            dxnorm,
+            rnorm,
+            epsx,
+            epsr,
+            norm(w),
+            Ax,
+            x_true,
+            preconditioner.system.b,
+        )
 
         # write(raw_data, "$i, $relative_residual, $relative_normwise_2, $relative_normwise_i, $relative_normwise_f, $(base_cost * i), $(prec_cost * (i + 1))\n")
         @label relres
         for tol in relative_residual_tolerances
             if relative_residual <= tol
-                deleteat!(relative_residual_tolerances, findfirst(x -> x == tol, relative_residual_tolerances))
-                write(relative_residual_out, "$i, $tol, $relative_residual, $(base_cost * i), $(prec_cost * (i + 1))\n")
+                deleteat!(
+                    relative_residual_tolerances,
+                    findfirst(x -> x == tol, relative_residual_tolerances),
+                )
+                write(
+                    relative_residual_out,
+                    "$i, $tol, $relative_residual, $(base_cost * i), $(prec_cost * (i + 1))\n",
+                )
                 @goto relres
             end
         end
         @label relnormwise2
         for tol in relative_normwise_2_tolerances
             if relative_normwise_2 <= tol
-                deleteat!(relative_normwise_2_tolerances, findfirst(x -> x == tol, relative_normwise_2_tolerances))
-                write(relative_normwise_2_out, "$i, $tol, $relative_normwise_2, $(base_cost * i), $(prec_cost * (i + 1))\n")
+                deleteat!(
+                    relative_normwise_2_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_2_tolerances),
+                )
+                write(
+                    relative_normwise_2_out,
+                    "$i, $tol, $relative_normwise_2, $(base_cost * i), $(prec_cost * (i + 1))\n",
+                )
                 @goto relnormwise2
             end
         end
         @label relnormwisei
         for tol in relative_normwise_i_tolerances
             if relative_normwise_i <= tol
-                deleteat!(relative_normwise_i_tolerances, findfirst(x -> x == tol, relative_normwise_i_tolerances))
-                write(relative_normwise_i_out, "$i, $tol, $relative_normwise_i, $(base_cost * i), $(prec_cost * (i + 1))\n")
+                deleteat!(
+                    relative_normwise_i_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_i_tolerances),
+                )
+                write(
+                    relative_normwise_i_out,
+                    "$i, $tol, $relative_normwise_i, $(base_cost * i), $(prec_cost * (i + 1))\n",
+                )
                 @goto relnormwisei
             end
         end
         @label relnormwisef
         for tol in relative_normwise_f_tolerances
             if relative_normwise_f <= tol
-                deleteat!(relative_normwise_f_tolerances, findfirst(x -> x == tol, relative_normwise_f_tolerances))
-                write(relative_normwise_f_out, "$i, $tol, $relative_normwise_f, $(base_cost * i), $(prec_cost * (i + 1))\n")
+                deleteat!(
+                    relative_normwise_f_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_f_tolerances),
+                )
+                write(
+                    relative_normwise_f_out,
+                    "$i, $tol, $relative_normwise_f, $(base_cost * i), $(prec_cost * (i + 1))\n",
+                )
                 @goto relnormwisef
             end
         end
         iter = i
-        if isempty(relative_residual_tolerances) && isempty(relative_normwise_2_tolerances) && isempty(relative_normwise_i_tolerances) && isempty(relative_normwise_f_tolerances)
+        if isempty(relative_residual_tolerances) &&
+           isempty(relative_normwise_2_tolerances) &&
+           isempty(relative_normwise_i_tolerances) &&
+           isempty(relative_normwise_f_tolerances)
             break
         end
 
