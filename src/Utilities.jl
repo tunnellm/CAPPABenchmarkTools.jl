@@ -178,7 +178,7 @@ end
 """
     do_log(location::String, msg::AbstractString)
 
-Appends a plain string message to the log file at `location`, 
+Appends a plain string message to the log file at `location`,
 preceded by a timestamp.
 """
 function do_log(location::String, msg::AbstractString)
@@ -191,7 +191,7 @@ end
 """
     do_log(location::String, err::Exception)
 
-Appends an exception report to the log file at `location`, 
+Appends an exception report to the log file at `location`,
 preceded by a timestamp. Includes the full error message and stacktrace.
 """
 function do_log(location::String, err::Exception)
@@ -574,7 +574,7 @@ function load_graph(filename::String, reordering::String)
 
     return problem_interface(
         package(
-            Laplacian,
+            Float64.(Laplacian),
             L_RHS,
             seed,
             filename_stripped,
@@ -592,7 +592,7 @@ function load_graph(filename::String, reordering::String)
             0,
         ),
         package(
-            SPD_Laplacian,
+            Float64.(SPD_Laplacian),
             SPD_RHS,
             SPD_Laplacian_seed,
             filename_stripped,

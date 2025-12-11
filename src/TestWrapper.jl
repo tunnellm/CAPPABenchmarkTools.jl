@@ -86,7 +86,7 @@ Runs iterative solvers on a given matrix with multiple preconditioners and store
 - If an iterative solver encounters an error, it is logged, and execution continues.
 """
 function run_matrix(matrix_name::String, preconditioners::Vector{Function}, args, reordering::String; run_conjugate_gradient::Bool=true, run_minres::Bool=true, loader::Symbol=:SPD_matrix, results_location::String="./results/")
-    
+
     @assert run_conjugate_gradient == true || run_minres == true
 
     mat::problem_interface = loader == :SPD_matrix ? load_matrix(matrix_name, reordering) : load_graph(matrix_name, reordering)
@@ -164,9 +164,9 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
     mr_control_work = check_previous(mr_location, "Control/", true) * nnz(matrix.Scaled.A)
 
     for (i, preconditioner) in enumerate(preconditioners)
-        
+
         output_filename = string(preconditioner) * "/"
-        
+
         if typeof(args[i]) <: Tuple
             for arg in args[i]
                 output_filename *= string(arg) * "/"
@@ -193,6 +193,14 @@ function run_matrix(matrix::problem_interface, preconditioners::Vector{Function}
             run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), "Skipping $(string(preconditioner)) for $(matrix.name), $output_filename")
             continue
         end
+
+
+        run_conjugate_gradient && mkpath(joinpath(cg_location, output_filename))
+        run_minres && mkpath(joinpath(mr_location, output_filename))
+
+        run_conjugate_gradient && do_log(joinpath(cg_location, output_filename, "log.txt"), "Running $(string(preconditioner)) for $(matrix.name), $output_filename")
+        run_minres && do_log(joinpath(mr_location, output_filename, "log.txt"), "Running $(string(preconditioner)) for $(matrix.name), $output_filename")
+
         try
             if args[i] === nothing
                 p = preconditioner(matrix)

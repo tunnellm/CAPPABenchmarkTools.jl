@@ -28,7 +28,7 @@ export Control  # Identity
 export TruncatedNeumann  # Truncated Neumann
 export SOR, SSOR, GaussSeidel, SymmetricGaussSeidel  # Iterative methods
 export IncompleteCholesky, ModifiedIncompleteCholesky  # Incomplete Cholesky (MATLAB)
-export SuperILU, SuperLLT  # SuperLU 
+export SuperILU, SuperLLT  # SuperLU
 export SymmetricSPAI  # Saunders (MATLAB)
 export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
 export LaplaceStripped # Laplacians.jl
@@ -1528,7 +1528,7 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
 
                 if split >= 1 && merge < 1
                     llmat = Laplacians.LLmatp(asub, split)
-                    ldli = Laplacians.approxChol(llmat, split)
+                    ldli = Laplacians.approxChol(llmat, split, merge)
                 elseif split >= 1 && merge >= 1
                     llmat = Laplacians.LLmatp(asub, split)
                     ldli = Laplacians.approxChol(llmat, split, merge)
@@ -1552,12 +1552,12 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
         if fixedOrder
             if split >= 1 && merge == split
                 llmat = Laplacians.LLMatOrd(a, split)
-                ldli = Laplacians.approxChol(llmat, split)
+                ldli = Laplacians.approxChol(llmat, split, MergeSort)
             elseif split >= 1 && merge != split
                 println(
                     "Fixed-order solve with merge != split not implemented here. Abort.",
                 )
-                return 0, 0, true # bool error 
+                return 0, 0, true # bool error
             else
                 llmat = Laplacians.LLMatOrd(a)
                 ldli = Laplacians.approxChol(llmat)
@@ -1565,7 +1565,7 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
         else
             if split >= 1 && merge < 1
                 llmat = Laplacians.LLmatp(a, split)
-                ldli = Laplacians.approxChol(llmat, split)
+                ldli = Laplacians.approxChol(llmat, split, merge)
             elseif split >= 1 && merge >= 1
                 llmat = Laplacians.LLmatp(a, split)
                 ldli = Laplacians.approxChol(llmat, split, merge)
