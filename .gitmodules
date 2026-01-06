@@ -1,0 +1,11 @@
+[submodule "External/LimitedLDLFactorizations"]
+	path = External/LimitedLDLFactorizations
+	url = https://github.com/tunnellm/LimitedLDLFactorizations.jl
+	branch = track-flops
+[submodule "External/FastSSAI3"]
+	path = External/FastSSAI3
+	url = https://github.com/tunnellm/FastSSAI3.jl
+[submodule "External/ILUK"]
+	path = External/ILUK
+	url = https://github.com/tunnellm/ILUK.jl
+	branch = track-flops

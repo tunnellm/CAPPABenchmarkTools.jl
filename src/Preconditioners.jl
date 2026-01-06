@@ -23,6 +23,9 @@ using CSV
 using DataFrames
 using Random
 
+include("Dependencies.jl")
+using .Dependencies: LimitedLDLFactorizationsFlops, FastSSAI, ILUKFlops
+
 export Preconditioner  # Preconditioner
 export Control  # Identity
 export TruncatedNeumann  # Truncated Neumann
@@ -30,15 +33,17 @@ export SOR, SSOR, GaussSeidel, SymmetricGaussSeidel  # Iterative methods
 export IncompleteCholesky, ModifiedIncompleteCholesky  # Incomplete Cholesky (MATLAB)
 export SuperILU, SuperLLT  # SuperLU
 export SymmetricSPAI  # Saunders (MATLAB)
+export SSAI  # FastSSAI3 (Julia)
 export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
 export LaplaceStripped # Laplacians.jl
 export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
-export RandomizedNystrom, LimitedLDL
+export RandomizedNystrom, LimitedLDL, LimitedLDLShiftPD, LimitedLDLAbsPD
+export ILUKShiftPD, ILUKAbsPD  # ILUK (Julia)
 export conda_install_dependencies
 
 # Path to the dependencies directory, used for locating external scripts and data files.
-const DEP_DIR = joinpath(@__DIR__, "..", "DEPENDENCIES")
+const EXT = joinpath(@__DIR__, "..", "External")
 
 """
     Preconditioner(LinearOperator::Function, num_multiplications::UInt64, system::package)
@@ -1020,7 +1025,7 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
 
     try
 
-        MATLAB.eval_string(session, "addpath(\"$(DEP_DIR)\")")
+        MATLAB.eval_string(session, "addpath(\"$(EXT)\")")
 
         MATLAB.put_variable(session, :sz, Float64(size(input.A, 1)))
         MATLAB.put_variable(
@@ -1058,6 +1063,60 @@ function SymmetricSPAI(input::package, fill_factor::Float64)
         rethrow(y)
     finally
         MATLAB.close(session)
+    end
+end
+
+
+"""
+    SSAI(input::problem_interface, fill_factor::Real)
+
+Constructs a Symmetric Sparse Approximate Inverse (SSAI) preconditioner using FastSSAI3.
+
+Algorithm by Shaked Regev and Michael Saunders, ICME, Stanford University.
+Reference: https://stanford.edu/group/SOL/reports/20SSAI.pdf
+
+# Arguments
+- `input::problem_interface`: The problem interface containing different representations of the system.
+- `fill_factor::Real`: Multiplier for average column degree to determine target fill level.
+
+# Returns
+- `Preconditioner`: A struct encapsulating the SSAI preconditioner.
+
+# Notes
+- This function applies the preconditioner to the `Scaled` version of the problem interface.
+- The `fill_factor` determines the trade-off between accuracy and sparsity.
+- Uses the optimized Julia implementation from FastSSAI3.jl.
+"""
+function SSAI(input::problem_interface, fill_factor::Real)
+    return SSAI(input.Scaled, fill_factor)
+end
+
+function SSAI(input::package, fill_factor::Real)
+    try
+        M, generation_work = FastSSAI.ssai3(input.A; fill_factor=fill_factor)
+
+        function LinearOperator(y, r)
+            mul!(y, M, r)
+        end
+
+        num_multiplications = nnz(M)
+
+        println(
+            "Created SSAI Preconditioner for $(input.name) with fill_factor $fill_factor. FLOPs: $generation_work",
+        )
+
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(generation_work),
+            input,
+        )
+
+    catch e
+        println(
+            "Error creating SSAI Preconditioner for $(input.name) with fill_factor $fill_factor.",
+        )
+        rethrow(e)
     end
 end
 
@@ -1348,6 +1407,316 @@ function LimitedLDL(input::package, memory::Integer, droptol::Real)
         rethrow()
     end
 end
+
+
+"""
+    LimitedLDLShiftPD(input::problem_interface, memory::Integer, droptol::Real)
+
+Constructs a Limited-Memory LDLᵀ preconditioner with positive definiteness enforced via shifting.
+Uses the vendored LimitedLDLFactorizations fork (track-flops branch) which:
+- Enforces positive definiteness by adding shifts when any diagonal entry of D becomes non-positive
+- Restarts factorization with increased shift until all diagonal entries are positive
+- Tracks the number of floating-point operations (FLOPs) during factorization
+
+Retry strategy:
+1. First try with α=0 (uses default 3 internal retries)
+2. If still fails, retry with α=1e-3, then continue with α_out until success
+
+The total FLOP count across all attempts is used as the `generation_work` metric.
+"""
+function LimitedLDLShiftPD(input::problem_interface, memory::Integer, droptol::Real)
+    return LimitedLDLShiftPD(input.Scaled, memory, droptol)
+end
+
+function LimitedLDLShiftPD(input::package, memory::Integer, droptol::Real)
+
+    nznum = (nnz(input.A) - size(input.A, 1)) / 2
+    nzpercol = nznum / size(input.A, 1)
+    memory_val = ceil(Int, nzpercol * memory)
+    n = size(input.A, 1)
+    P = collect(1:n)
+
+    try
+        total_flops = 0
+
+        # Phase 1: Try with α=0 (default internal retries)
+        ldl = LimitedLDLFactorizationsFlops.lldl_spd(
+            input.A;
+            P = P,
+            memory = memory_val,
+            droptol = droptol,
+            α = 0.0,
+        )
+        total_flops += ldl.flops
+
+        # Phase 2: If failed, retry with increasing α starting from 1e-3
+        α = 1e-3
+        while !LimitedLDLFactorizationsFlops.factorized(ldl)
+            ldl = LimitedLDLFactorizationsFlops.lldl_spd(
+                input.A;
+                P = P,
+                memory = memory_val,
+                droptol = droptol,
+                α = α,
+            )
+            total_flops += ldl.flops
+            α = ldl.α_out  # Use the next shift value for subsequent attempts
+        end
+
+        function LinearOperator(y, r)
+            y .= ldl \ r
+        end
+
+        num_multiplications = 2 * length(ldl.Lnzvals) + n
+
+        println(
+            "Created Limited LDL ShiftPD Preconditioner for $(input.name) with memory $memory and droptol $droptol. Total FLOPs: $total_flops, Final α: $(ldl.α_out)",
+        )
+
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(total_flops),
+            input,
+        )
+
+    catch e
+        println(
+            "Error creating Limited LDL ShiftPD Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
+        )
+        rethrow(e)
+    end
+end
+
+
+"""
+    LimitedLDLAbsPD(input::problem_interface, memory::Integer, droptol::Real)
+
+Constructs a Limited-Memory LDLᵀ preconditioner with positive definiteness enforced via absolute value.
+Uses the vendored LimitedLDLFactorizations fork (track-flops branch) which:
+- Performs standard (potentially indefinite) LDLᵀ factorization
+- Takes absolute value of diagonal entries D to ensure positive definiteness
+- Tracks the number of floating-point operations (FLOPs) during factorization
+
+Retry strategy:
+1. First try with α=0 (uses default 3 internal retries)
+2. If still fails (due to zero pivot), retry with α=1e-3, then continue with α_out until success
+
+The total FLOP count across all attempts is used as the `generation_work` metric.
+"""
+function LimitedLDLAbsPD(input::problem_interface, memory::Integer, droptol::Real)
+    return LimitedLDLAbsPD(input.Scaled, memory, droptol)
+end
+
+function LimitedLDLAbsPD(input::package, memory::Integer, droptol::Real)
+
+    nznum = (nnz(input.A) - size(input.A, 1)) / 2
+    nzpercol = nznum / size(input.A, 1)
+    memory_val = ceil(Int, nzpercol * memory)
+    n = size(input.A, 1)
+    P = collect(1:n)
+
+    try
+        total_flops = 0
+
+        # Phase 1: Try with α=0 (default internal retries)
+        ldl = LimitedLDLFactorizationsFlops.lldl(
+            input.A;
+            P = P,
+            memory = memory_val,
+            droptol = droptol,
+            α = 0.0,
+        )
+        total_flops += ldl.flops
+
+        # Phase 2: If failed (zero pivot), retry with increasing α starting from 1e-3
+        α = 1e-3
+        while !LimitedLDLFactorizationsFlops.factorized(ldl)
+            ldl = LimitedLDLFactorizationsFlops.lldl(
+                input.A;
+                P = P,
+                memory = memory_val,
+                droptol = droptol,
+                α = α,
+            )
+            total_flops += ldl.flops
+            α = ldl.α_out  # Use the next shift value for subsequent attempts
+        end
+
+        # Take absolute value of diagonal to enforce positive definiteness
+        ldl.D .= abs.(ldl.D)
+
+        function LinearOperator(y, r)
+            y .= ldl \ r
+        end
+
+        num_multiplications = 2 * length(ldl.Lnzvals) + n
+
+        neg_count = count(x -> x < 0, ldl.D)  # Will be 0 after abs, but check before would be useful
+        println(
+            "Created Limited LDL AbsPD Preconditioner for $(input.name) with memory $memory and droptol $droptol. Total FLOPs: $total_flops, Final α: $(ldl.α_out)",
+        )
+
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(total_flops),
+            input,
+        )
+
+    catch e
+        println(
+            "Error creating Limited LDL AbsPD Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
+        )
+        rethrow(e)
+    end
+end
+
+
+"""
+    ILUKShiftPD(input::problem_interface, k::Integer)
+
+Constructs an Incomplete LDLᵀ preconditioner with level-of-fill k and positive definiteness
+enforced via shifting. Uses the vendored ILUK fork (track-flops branch) which:
+- Enforces positive definiteness by adding shifts when pivots become non-positive
+- Restarts factorization with increased shift until all pivots are positive
+- Tracks the number of floating-point operations (FLOPs) during factorization
+
+Retry strategy:
+1. First try with α=0 (uses default 3 internal retries)
+2. If still fails, retry with α=1e-3, then continue with shift*10 until success
+
+The total FLOP count across all attempts is used as the `generation_work` metric.
+"""
+function ILUKShiftPD(input::problem_interface, k::Integer)
+    return ILUKShiftPD(input.Scaled, k)
+end
+
+function ILUKShiftPD(input::package, k::Integer)
+    n = size(input.A, 1)
+
+    try
+        total_flops = 0
+
+        # Phase 1: Try with α=0 (default internal retries with ensure_positive=true)
+        ldl = ILUKFlops.ldlt_k(
+            input.A, k;
+            α = 0.0,
+            ensure_positive = true,
+        )
+        total_flops += ldl.flops
+
+        # Phase 2: If failed, retry with increasing α starting from 1e-3
+        α = 1e-3
+        while !ldl.success
+            ldl = ILUKFlops.ldlt_k(
+                input.A, k;
+                α = α,
+                ensure_positive = true,
+            )
+            total_flops += ldl.flops
+            α = ldl.shift * 10  # Use the next shift value for subsequent attempts
+        end
+
+        function LinearOperator(y, r)
+            y .= ldl \ r
+        end
+
+        num_multiplications = 2 * nnz(ldl.L) + n
+
+        println(
+            "Created ILUK ShiftPD Preconditioner for $(input.name) with k=$k. Total FLOPs: $total_flops, Final shift: $(ldl.shift)",
+        )
+
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(total_flops),
+            input,
+        )
+
+    catch e
+        println(
+            "Error creating ILUK ShiftPD Preconditioner for $(input.name) with k=$k.",
+        )
+        rethrow(e)
+    end
+end
+
+
+"""
+    ILUKAbsPD(input::problem_interface, k::Integer)
+
+Constructs an Incomplete LDLᵀ preconditioner with level-of-fill k and positive definiteness
+enforced via absolute value. Uses the vendored ILUK fork (track-flops branch) which:
+- Performs standard (potentially indefinite) LDLᵀ factorization
+- Takes absolute value of diagonal entries D to ensure positive definiteness
+- Tracks the number of floating-point operations (FLOPs) during factorization
+
+Retry strategy:
+1. First try with α=0 (uses default 3 internal retries)
+2. If still fails (due to zero pivot), retry with α=1e-3, then continue with shift*10 until success
+
+The total FLOP count across all attempts is used as the `generation_work` metric.
+"""
+function ILUKAbsPD(input::problem_interface, k::Integer)
+    return ILUKAbsPD(input.Scaled, k)
+end
+
+function ILUKAbsPD(input::package, k::Integer)
+    n = size(input.A, 1)
+
+    try
+        total_flops = 0
+
+        # Phase 1: Try with α=0 (default internal retries)
+        ldl = ILUKFlops.ldlt_k(
+            input.A, k;
+            α = 0.0,
+            ensure_positive = false,
+        )
+        total_flops += ldl.flops
+
+        # Phase 2: If failed (zero pivot), retry with increasing α starting from 1e-3
+        α = 1e-3
+        while !ldl.success
+            ldl = ILUKFlops.ldlt_k(
+                input.A, k;
+                α = α,
+                ensure_positive = false,
+            )
+            total_flops += ldl.flops
+            α = ldl.shift * 10  # Use the next shift value for subsequent attempts
+        end
+
+        # Take absolute value of diagonal to enforce positive definiteness
+        ldl.D .= abs.(ldl.D)
+
+        function LinearOperator(y, r)
+            y .= ldl \ r
+        end
+
+        num_multiplications = 2 * nnz(ldl.L) + n
+
+        println(
+            "Created ILUK AbsPD Preconditioner for $(input.name) with k=$k. Total FLOPs: $total_flops, Final shift: $(ldl.shift)",
+        )
+
+        return Preconditioner(
+            LinearOperator,
+            num_multiplications,
+            Float64(total_flops),
+            input,
+        )
+
+    catch e
+        println(
+            "Error creating ILUK AbsPD Preconditioner for $(input.name) with k=$k.",
+        )
+        rethrow(e)
+    end
+end
+
 
 function RandomizedNystrom(
     input::problem_interface,
@@ -1781,7 +2150,7 @@ end
 
 function CombinatorialMG(mat::package)
     try
-        work_lookup = CSV.read(joinpath(DEP_DIR, "CombinatorialWorkCost.csv"), DataFrame)
+        work_lookup = CSV.read(joinpath(EXT, "CombinatorialWorkCost.csv"), DataFrame)
 
         idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
 
@@ -1816,7 +2185,7 @@ end
 
 function CombinatorialMG(input::package, run_on::package)
     try
-        work_lookup = CSV.read(joinpath(DEP_DIR, "CombinatorialWorkCost.csv"), DataFrame)
+        work_lookup = CSV.read(joinpath(EXT, "CombinatorialWorkCost.csv"), DataFrame)
 
         idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
 
