@@ -9,3 +9,6 @@
 	path = External/ILUK
 	url = https://github.com/tunnellm/ILUK.jl
 	branch = track-flops
+[submodule "External/pyamg"]
+	path = External/pyamg
+	url = https://github.com/tunnellm/pyamg
