@@ -41,7 +41,7 @@ export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
 export RandomizedNystrom, LimitedLDL, LimitedLDLShiftPD, LimitedLDLAbsPD
 export ILUKShiftPD, ILUKAbsPD  # ILUK (Julia)
-export conda_install_dependencies
+export conda_install_dependencies, install_vendored_pyamg
 
 # Path to the dependencies directory, used for locating external scripts and data files.
 const EXT = joinpath(@__DIR__, "..", "External")
@@ -76,13 +76,24 @@ function conda_install_dependencies()
     CondaPkg.add("PyAMG")
 end
 
-# Vendored pyamg with setup_complexity() for generation work tracking
-# Import under different name to avoid conflicts with pip-installed pyamg
-function _get_vendored_pyamg()
-    sys = PythonCall.pyimport("sys")
+"""
+    install_vendored_pyamg()
+
+Install the vendored pyamg fork from External/pyamg using pip in editable mode.
+This version includes setup_complexity() for tracking generation work.
+Run this once before using AMG_ruge_stuben_flops or AMG_smoothed_aggregation_flops.
+"""
+function install_vendored_pyamg()
     pyamg_path = joinpath(EXT, "pyamg")
-    # Insert at front of path to take precedence
-    sys.path.insert(0, pyamg_path)
+    subprocess = PythonCall.pyimport("subprocess")
+    sys = PythonCall.pyimport("sys")
+    println("Installing vendored pyamg from $pyamg_path...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-e", pyamg_path, "--force-reinstall"])
+    println("Vendored pyamg installed.")
+end
+
+# Helper to import pyamg (assumes install_vendored_pyamg was called)
+function _get_vendored_pyamg()
     return PythonCall.pyimport("pyamg")
 end
 
