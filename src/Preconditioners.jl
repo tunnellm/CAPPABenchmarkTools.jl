@@ -74,6 +74,7 @@ function conda_install_dependencies()
     CondaPkg.add("numpy")
     CondaPkg.add("scipy")
     CondaPkg.add("PyAMG")
+    CondaPkg.add("pip")
 end
 
 """
@@ -82,14 +83,28 @@ end
 Install the vendored pyamg fork from External/pyamg using pip in editable mode.
 This version includes setup_complexity() for tracking generation work.
 Run this once before using AMG_ruge_stuben_flops or AMG_smoothed_aggregation_flops.
+
+Note: Requires pip in the Conda environment. Run conda_install_dependencies() first if pip is missing.
 """
 function install_vendored_pyamg()
     pyamg_path = joinpath(EXT, "pyamg")
     subprocess = PythonCall.pyimport("subprocess")
     sys = PythonCall.pyimport("sys")
+
     println("Installing vendored pyamg from $pyamg_path...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-e", pyamg_path, "--force-reinstall"])
-    println("Vendored pyamg installed.")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", pyamg_path, "--force-reinstall"],
+        capture_output=true,
+        text=true
+    )
+
+    returncode = PythonCall.pyconvert(Int, result.returncode)
+    if returncode != 0
+        stderr_msg = PythonCall.pyconvert(String, result.stderr)
+        error("Failed to install vendored pyamg (exit code $returncode): $stderr_msg")
+    end
+
+    println("Vendored pyamg installed successfully.")
 end
 
 # Helper to import pyamg (assumes install_vendored_pyamg was called)
