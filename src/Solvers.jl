@@ -3,7 +3,7 @@ module Solvers
 using SparseArrays
 using LinearAlgebra
 
-export preconditioned_conjugate_gradient, preconditioned_minres
+export preconditioned_conjugate_gradient, preconditioned_conjugate_residual, preconditioned_minres
 
 using ..Utilities: norm_information, compute_tolerances
 using ..Preconditioners: Preconditioner
@@ -391,6 +391,397 @@ function preconditioned_conjugate_gradient(
 
 
         if work_limit > 0 && (base_cost * i + prec_cost * (i + 1)) > work_limit
+            iter = -2
+            break
+        end
+
+    end
+    close(compressed_data_stream)
+    close(raw_data_stream)
+    close(raw_data)
+    close(relative_residual_out)
+    close(relative_normwise_2_out)
+    close(relative_normwise_i_out)
+    close(relative_normwise_f_out)
+    return iter
+end
+
+
+"""
+    pcr_print(
+        stream,
+        i,
+        relative_residual,
+        relative_normwise_2,
+        relative_normwise_i,
+        relative_normwise_f,
+        error,
+        base_cost,
+        prec_cost,
+        α,
+        r1,
+        zAz,
+        ApAp,
+        np,
+        Ax,
+        x,
+        b
+    )
+
+Writes iteration metrics for the Preconditioned Conjugate Residual (PCR) algorithm to the specified stream.
+
+# Arguments
+- `stream`: Output stream where the iteration data is written.
+- `i::Int`: Current iteration number.
+- `relative_residual::Float64`: Relative residual of the solution.
+- `relative_normwise_2::Float64`: Relative 2-norm of the solution.
+- `relative_normwise_i::Float64`: Relative norm-wise error at initialization.
+- `relative_normwise_f::Float64`: Relative norm-wise error at final iteration.
+- `error::Float64`: Current computed error.
+- `base_cost::Float64`: Accumulated computational cost of matrix-vector products.
+- `prec_cost::Float64`: Accumulated computational cost of preconditioning operations.
+- `α::Float64`: Step size parameter for the PCR iteration.
+- `r1::Vector`: Residual vector at the current iteration.
+- `zAz::Float64`: Inner product of the preconditioned residual and A times preconditioned residual.
+- `ApAp::Float64`: Inner product of A times the conjugate direction vector.
+- `np::Float64`: Norm of the conjugate direction vector.
+- `Ax::Vector`: Result of matrix-vector multiplication `A * x`.
+- `x::Vector`: Current solution estimate.
+- `b::Vector`: Right-hand side vector of the linear system.
+
+"""
+function pcr_print(
+    stream,
+    i,
+    relative_residual,
+    relative_normwise_2,
+    relative_normwise_i,
+    relative_normwise_f,
+    error,
+    base_cost,
+    prec_cost,
+    α,
+    r1,
+    zAz,
+    ApAp,
+    np,
+    Ax,
+    x,
+    b,
+)
+
+    write(stream, string(i))
+    write(stream, comma)
+    write(stream, string(relative_residual))
+    write(stream, comma)
+    write(stream, string(error))
+    write(stream, comma)
+    write(stream, string(relative_normwise_2))
+    write(stream, comma)
+    write(stream, string(relative_normwise_i))
+    write(stream, comma)
+    write(stream, string(relative_normwise_f))
+    write(stream, comma)
+    write(stream, string(base_cost * (i + 1)))
+    write(stream, comma)
+    write(stream, string(prec_cost * (i + 1)))
+    write(stream, comma)
+    write(stream, string(abs(α)))
+    write(stream, comma)
+    write(stream, string(norm(r1)))
+    write(stream, comma)
+    write(stream, string(zAz))
+    write(stream, comma)
+    write(stream, string(ApAp))
+    write(stream, comma)
+    write(stream, string(np))
+    write(stream, comma)
+    write(stream, string(0.5 * (x' * Ax) - x' * b))
+    write(stream, newline)
+
+end
+
+"""
+    preconditioned_conjugate_residual(
+        preconditioner::Preconditioner,
+        maxiters::Int64,
+        raw_data_out::String,
+        convergence_data_out::String;
+        work_limit::Int64 = -1
+    )
+
+Solves the linear system `Ax = b` using the Preconditioned Conjugate Residual (PCR) method with a given preconditioner.
+
+# Arguments
+- `preconditioner::Preconditioner`: The preconditioner, which includes a `package` struct containing the system to be solved.
+- `maxiters::Int64`: The maximum number of iterations.
+- `raw_data_out::String`: Path to the file where raw iteration data will be stored. This file will be compressed using Zstd.
+- `convergence_data_out::String`: Path prefix for convergence data output files.
+- `work_limit::Int64` (optional, default `-1`): Maximum allowed computational work before termination. If `-1`, no limit is set.
+
+# Returns
+- `iter::Int`: The number of iterations performed.
+
+# Notes
+- The function extracts the system matrix `A` and right-hand side `b` from `preconditioner.package.system`.
+- Uses the preconditioner to accelerate convergence.
+- Unlike PCG which minimizes the A-norm of the error, PCR minimizes the 2-norm of the residual.
+- Iteration data, including relative residuals and norm-wise relative backward errors, is logged to the specified output files.
+- The algorithm terminates when convergence is reached, the iteration limit is hit, or computational work exceeds `work_limit`.
+"""
+function preconditioned_conjugate_residual(
+    preconditioner::Preconditioner,
+    maxiters::Int64,
+    raw_data_out::String,
+    convergence_data_out::String;
+    work_limit::Int64 = -1,
+)
+
+    base_cost = nnz(preconditioner.system.A)
+    prec_cost = preconditioner.num_multiplications
+
+    raw_data = open(raw_data_out, "w")
+    raw_data_stream = BufferedOutputStream(raw_data, buffer_size)
+    compressed_data_stream = ZstdCompressorStream(raw_data_stream, level = 1)
+
+    write(compressed_data_stream, raw_header)
+
+    relative_residual_out = open(convergence_data_out * "_relative_residual.csv", "w")
+    write(relative_residual_out, convergence_header)
+    relative_normwise_2_out = open(convergence_data_out * "_relative_normwise_2.csv", "w")
+    write(relative_normwise_2_out, convergence_header)
+    relative_normwise_i_out = open(convergence_data_out * "_relative_normwise_i.csv", "w")
+    write(relative_normwise_i_out, convergence_header)
+    relative_normwise_f_out = open(convergence_data_out * "_relative_normwise_f.csv", "w")
+    write(relative_normwise_f_out, convergence_header)
+
+    relative_residual_tolerances = copy(tolerances)
+    relative_normwise_2_tolerances = copy(tolerances)
+    relative_normwise_i_tolerances = copy(tolerances)
+    relative_normwise_f_tolerances = copy(tolerances)
+
+    norm_b = norm(preconditioner.system.b)
+
+    x = zeros(size(preconditioner.system.A, 1))
+    x_true = copy(x)
+    r = copy(preconditioner.system.b)
+
+    z = zeros(size(preconditioner.system.A, 1))
+
+    preconditioner.LinearOperator(z, r)
+
+    # For CR, we need Az (A times preconditioned residual)
+    Az = zeros(size(preconditioner.system.A, 1))
+    mul!(Az, preconditioner.system.A', z)
+
+    p = copy(z)
+    Ap = copy(Az)
+
+    iter = 0
+    Ax = zeros(size(preconditioner.system.b))
+
+    # CR uses z'*Az for numerator instead of r'*z
+    zAz_old = z' * Az
+
+    # CR uses (Ap)'*(Ap) for denominator instead of p'*Ap
+    ApAp = Ap' * Ap
+
+    α = zAz_old / ApAp
+
+    r_true = copy(preconditioner.system.b)
+
+    np = norm(p)
+
+    pcr_print(
+        compressed_data_stream,
+        0,
+        compute_tolerances(norm(r), norm_b, norm(x), preconditioner.system.norms)...,
+        norm(preconditioner.system.seed),
+        base_cost,
+        prec_cost,
+        α,
+        r,
+        zAz_old,
+        ApAp,
+        np,
+        Ax,
+        x,
+        preconditioner.system.b,
+    )
+
+    for i = 1:maxiters
+
+        iter = i
+
+        zAz_new = z' * Az
+
+        if i > 1
+
+            β = zAz_new / zAz_old
+            p .= z .+ β .* p
+            Ap .= Az .+ β .* Ap
+
+        end
+
+        ApAp = Ap' * Ap
+
+        α = zAz_new / ApAp
+
+        x .+= α .* p
+
+        r .-= α .* Ap
+
+        preconditioner.LinearOperator(z, r)
+
+        mul!(Az, preconditioner.system.A', z)
+
+        zAz_old = zAz_new
+
+        if preconditioner.system.nullspace > 0
+            x_true .= x .- x[preconditioner.system.nullspace]
+        else
+            x_true .= x
+        end
+
+        mul!(Ax, preconditioner.system.A', x_true)
+
+        r_true .= preconditioner.system.b .- Ax
+
+        relative_residual, relative_normwise_2, relative_normwise_i, relative_normwise_f =
+            compute_tolerances(
+                norm(r_true),
+                norm_b,
+                norm(x_true),
+                preconditioner.system.norms,
+            )
+
+        np = norm(p)
+
+        pcr_print(
+            compressed_data_stream,
+            i,
+            relative_residual,
+            relative_normwise_2,
+            relative_normwise_i,
+            relative_normwise_f,
+            norm(preconditioner.system.seed .- x_true),
+            base_cost,
+            prec_cost,
+            α,
+            r,
+            zAz_new,
+            ApAp,
+            np,
+            Ax,
+            x_true,
+            preconditioner.system.b,
+        )
+
+
+        if isnan(α)
+            close(compressed_data_stream)
+            close(raw_data_stream)
+            close(raw_data)
+            close(relative_residual_out)
+            close(relative_normwise_2_out)
+            close(relative_normwise_i_out)
+            close(relative_normwise_f_out)
+            throw(ArgumentError("NaN Detected in Conjugate Residual"))
+        end
+
+
+        @label relres
+        for tol in relative_residual_tolerances
+            if relative_residual <= tol
+                deleteat!(
+                    relative_residual_tolerances,
+                    findfirst(x -> x == tol, relative_residual_tolerances),
+                )
+                write(relative_residual_out, string(i))
+                write(relative_residual_out, comma)
+                write(relative_residual_out, string(tol))
+                write(relative_residual_out, comma)
+                write(relative_residual_out, string(relative_residual))
+                write(relative_residual_out, comma)
+                write(relative_residual_out, string(base_cost * (i + 1)))
+                write(relative_residual_out, comma)
+                write(relative_residual_out, string(prec_cost * (i + 1)))
+                write(relative_residual_out, newline)
+                @goto relres
+            end
+        end
+        @label relnormwise2
+        for tol in relative_normwise_2_tolerances
+            if relative_normwise_2 <= tol
+                deleteat!(
+                    relative_normwise_2_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_2_tolerances),
+                )
+                write(relative_normwise_2_out, string(i))
+                write(relative_normwise_2_out, comma)
+                write(relative_normwise_2_out, string(tol))
+                write(relative_normwise_2_out, comma)
+                write(relative_normwise_2_out, string(relative_normwise_2))
+                write(relative_normwise_2_out, comma)
+                write(relative_normwise_2_out, string(base_cost * (i + 1)))
+                write(relative_normwise_2_out, comma)
+                write(relative_normwise_2_out, string(prec_cost * (i + 1)))
+                write(relative_normwise_2_out, newline)
+                @goto relnormwise2
+            end
+        end
+        @label relnormwisei
+        for tol in relative_normwise_i_tolerances
+            if relative_normwise_i <= tol
+                deleteat!(
+                    relative_normwise_i_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_i_tolerances),
+                )
+                write(relative_normwise_i_out, string(i))
+                write(relative_normwise_i_out, comma)
+                write(relative_normwise_i_out, string(tol))
+                write(relative_normwise_i_out, comma)
+                write(relative_normwise_i_out, string(relative_normwise_i))
+                write(relative_normwise_i_out, comma)
+                write(relative_normwise_i_out, string(base_cost * (i + 1)))
+                write(relative_normwise_i_out, comma)
+                write(relative_normwise_i_out, string(prec_cost * (i + 1)))
+                write(relative_normwise_i_out, newline)
+                @goto relnormwisei
+            end
+        end
+        @label relnormwisef
+        for tol in relative_normwise_f_tolerances
+            if relative_normwise_f <= tol
+                deleteat!(
+                    relative_normwise_f_tolerances,
+                    findfirst(x -> x == tol, relative_normwise_f_tolerances),
+                )
+                write(relative_normwise_f_out, string(i))
+                write(relative_normwise_f_out, comma)
+                write(relative_normwise_f_out, string(tol))
+                write(relative_normwise_f_out, comma)
+                write(relative_normwise_f_out, string(relative_normwise_f))
+                write(relative_normwise_f_out, comma)
+                write(relative_normwise_f_out, string(base_cost * (i + 1)))
+                write(relative_normwise_f_out, comma)
+                write(relative_normwise_f_out, string(prec_cost * (i + 1)))
+                write(relative_normwise_f_out, newline)
+                @goto relnormwisef
+            end
+        end
+
+        if (
+            isempty(relative_residual_tolerances) &&
+            isempty(relative_normwise_2_tolerances) &&
+            isempty(relative_normwise_i_tolerances) &&
+            isempty(relative_normwise_f_tolerances)
+        )
+            break
+        end
+
+
+        if work_limit > 0 && (base_cost * (i + 1) + prec_cost * (i + 1)) > work_limit
             iter = -2
             break
         end

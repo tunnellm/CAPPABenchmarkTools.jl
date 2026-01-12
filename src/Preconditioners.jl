@@ -36,7 +36,7 @@ export SymmetricSPAI  # Saunders (MATLAB)
 export SSAI  # FastSSAI3 (Julia)
 export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
 export AMG_ruge_stuben_flops, AMG_smoothed_aggregation_flops  # PyAmg (vendored, with work tracking)
-export LaplaceStripped # Laplacians.jl
+export LaplaceStripped, LaplaceStrippedFlops # Laplacians.jl
 export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
 export RandomizedNystrom, LimitedLDL, LimitedLDLShiftPD, LimitedLDLAbsPD
@@ -1457,9 +1457,10 @@ function AMG_ruge_stuben_flops(input::package, amg_cycle::String, num_cycles::In
         # Get generation work from setup_complexity() (numerical_work, graph_work)
         setup_work = ml.setup_complexity()
         numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
-        graph_work = PythonCall.pyconvert(Float64, setup_work[1])
+        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
+        _ = PythonCall.pyconvert(Float64, setup_work[1])
         nnz_A = nnz(input.A)
-        generation_work = (numerical_work + graph_work) * nnz_A
+        generation_work = (numerical_work) * nnz_A
 
         println(
             "Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
@@ -1537,9 +1538,9 @@ function AMG_smoothed_aggregation_flops(input::package, amg_cycle::String, num_c
         # Get generation work from setup_complexity() (numerical_work, graph_work)
         setup_work = ml.setup_complexity()
         numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
-        graph_work = PythonCall.pyconvert(Float64, setup_work[1])
+        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
         nnz_A = nnz(input.A)
-        generation_work = (numerical_work + graph_work) * nnz_A
+        generation_work = (numerical_work) * nnz_A
 
         println(
             "Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
@@ -2033,6 +2034,7 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
     local comps = Array{Array{Int,1}}(undef, 0)
     local solvers = Array{Function}(undef, 0)
     local num_mult_list = Array{Int,1}(undef, 0)
+    local generation_flops_list = Array{Int,1}(undef, 0)
 
     co = Laplacians.components(a)
 
@@ -2049,6 +2051,7 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
             flatNullComps = vcat(comps[nullComps]...)
             comps = vcat([flatNullComps], comps[setdiff(1:end, nullComps)])
             push!(solvers, Laplacians.nullSolver)
+            push!(generation_flops_list, 0)
 
         end
 
@@ -2069,7 +2072,11 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
 
                 ldli = cholesky(la_forced_sub)
 
-                push!(num_mult_list, 2 * nnz(sparse(ldli.L)))
+                L_sparse = sparse(ldli.L)
+                push!(num_mult_list, 2 * nnz(L_sparse))
+                # Generation FLOPs: Σⱼ nnz(Lⱼ)² for exact Cholesky
+                gen_flops = sum((L_sparse.colptr[j+1] - L_sparse.colptr[j])^2 for j in 1:size(L_sparse, 2))
+                push!(generation_flops_list, gen_flops)
 
                 F(b) = begin
                     bs = b[leave] .- mean(b)
@@ -2101,6 +2108,8 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
                 end
 
                 push!(num_mult_list, 2 * length(ldli.fval) + size(ldli.d, 1))
+                # Generation FLOPs: 7 ops per entry for approxChol
+                push!(generation_flops_list, 7 * length(ldli.fval))
 
                 push!(solvers, b -> Laplacians.LDLsolver(ldli, b))
 
@@ -2141,10 +2150,12 @@ function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false
         subSolver(b) = Laplacians.LDLsolver(ldli, b)
 
         push!(num_mult_list, 2 * length(ldli.fval) + size(ldli.d, 1))
+        # Generation FLOPs: 7 ops per entry for approxChol
+        push!(generation_flops_list, 7 * length(ldli.fval))
 
         push!(solvers, subSolver)
     end
-    return length(solvers), comps, solvers, num_mult_list
+    return length(solvers), comps, solvers, num_mult_list, generation_flops_list
 end
 
 
@@ -2161,7 +2172,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer)
 
     a = laplace_to_adj(input.A)
 
-    len, components, solvers, num_mult_list = getLapChol(a; split = split, merge = merge)
+    len, components, solvers, num_mult_list, _ = getLapChol(a; split = split, merge = merge)
 
     solver = solvers[1]
 
@@ -2184,7 +2195,7 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
 
     a = laplace_to_adj(A_aug_lap)
 
-    len, components, solvers, num_mult_list = getLapChol(a; split = split, merge = merge)
+    len, components, solvers, num_mult_list, _ = getLapChol(a; split = split, merge = merge)
 
     work_space = [zeros(length(component)) for component in components]
 
@@ -2211,6 +2222,75 @@ function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on:
     num_multiplications = sum(num_mult_list)
 
     return Preconditioner(LinearOperator, num_multiplications, Inf, run_on)
+end
+
+
+# LaplaceStrippedFlops: Returns (Preconditioner, generation_flops) for FLOP tracking
+
+function LaplaceStrippedFlops(mat::problem_interface, split::Integer, merge::Integer)
+    mat.type == :symmetric_graph && return LaplaceStrippedFlops(mat.Original, split, merge)
+    mat.Scaled.diagonally_dominant &&
+        return LaplaceStrippedFlops(mat.Scaled, split, merge, mat.Scaled)
+    mat.Original.diagonally_dominant &&
+        return LaplaceStrippedFlops(mat.Original, split, merge, mat.Original)
+    return LaplaceStrippedFlops(mat.Special, split, merge, mat.Scaled)
+end
+
+function LaplaceStrippedFlops(input::package, split::Integer, merge::Integer)
+
+    a = laplace_to_adj(input.A)
+
+    len, components, solvers, num_mult_list, generation_flops_list = getLapChol(a; split = split, merge = merge)
+
+    solver = solvers[1]
+
+    function LinearOperator(y, r)
+        y .= solver(r)
+    end
+
+    generation_flops = sum(generation_flops_list)
+    return Preconditioner(LinearOperator, num_mult_list[1], Float64(generation_flops), input)
+
+end
+
+function LaplaceStrippedFlops(input::package, split::Integer, merge::Integer, run_on::package)
+
+    A_aug_lap, _ = make_augmented(input.A, input.b)
+
+    local sz = size(input.A, 1)
+    local sol_ = zeros(size(A_aug_lap, 1))
+    local rhs = zeros(size(A_aug_lap, 1))
+
+    a = laplace_to_adj(A_aug_lap)
+
+    len, components, solvers, num_mult_list, generation_flops_list = getLapChol(a; split = split, merge = merge)
+
+    work_space = [zeros(length(component)) for component in components]
+
+    function LinearOperator(sol, r)
+
+        sol .= r
+
+        view(rhs, 1:sz) .= sol
+        view(rhs, sz+1:length(rhs)) .= .-sol
+
+        if len > 1
+            for i = 1:len
+                work_space[i] .= view(rhs, components[i])
+                sol_[components[i]] .= solvers[i](work_space[i])
+            end
+        else
+            sol_ .= solvers[1](rhs)
+        end
+
+        sol .= (view(sol_, 1:sz) .- view(sol_, sz+1:length(sol_))) ./ 2
+
+    end
+
+    num_multiplications = sum(num_mult_list)
+    generation_flops = sum(generation_flops_list)
+
+    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_flops), run_on)
 end
 
 
