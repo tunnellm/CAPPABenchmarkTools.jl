@@ -13,8 +13,13 @@ A lightweight Julia toolbox for benchmarking sparse linear solvers and precondit
 
 ## Installation
 
+```bash
+git clone --recurse-submodules https://github.com/tunnellm/CAPPABenchmarkTools.jl.git
+julia -e 'import Pkg; Pkg.develop(path="CAPPABenchmarkTools.jl")'
+```
+
+Then in Julia:
 ```julia
-] add https://github.com/tunnellm/CAPPABenchmarkTools.jl
 using CAPPABenchmarkTools
 ```
 
