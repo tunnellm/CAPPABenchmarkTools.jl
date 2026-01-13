@@ -35,7 +35,7 @@ export SuperILU, SuperLLT  # SuperLU
 export SymmetricSPAI  # Saunders (MATLAB)
 export SSAI  # FastSSAI3 (Julia)
 export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
-export AMG_ruge_stuben_flops, AMG_smoothed_aggregation_flops  # PyAmg (vendored, with work tracking)
+export AMG_ruge_stuben_flops, AMG_smoothed_aggregation_flops, AMG_rootnode_flops  # PyAmg (vendored, with work tracking)
 export LaplaceStripped, LaplaceStrippedFlops # Laplacians.jl
 export CombinatorialMG  # CombinatorialMultigrid.jl
 export SteepestDescent  # Basic iterative method
@@ -1549,6 +1549,89 @@ function AMG_smoothed_aggregation_flops(input::package, amg_cycle::String, num_c
     catch y
         println(
             "Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
+        )
+        rethrow(y)
+    end
+end
+
+
+"""
+    AMG_rootnode_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
+
+Constructs an Algebraic Multigrid (AMG) preconditioner using the Root-Node method from the
+vendored PyAMG fork with generation work tracking via setup_complexity().
+
+Root-node AMG is a variant of smoothed aggregation that preserves an identity block in the
+interpolation operator. Each aggregate has a 'root-node' associated with it, which is
+injected from the coarse grid to the fine grid.
+
+# Arguments
+- `mat::problem_interface`: The problem interface containing different representations of the system.
+- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
+- `num_cycles::Int64`: The number of cycles to apply.
+
+# Returns
+- `Preconditioner`: A struct encapsulating the AMG Root-Node preconditioner with generation_work.
+"""
+function AMG_rootnode_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
+    return AMG_rootnode_flops(mat, string(amg_cycle), num_cycles)
+end
+
+function AMG_rootnode_flops(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
+    return AMG_rootnode_flops(mat.Scaled, string(amg_cycle), num_cycles)
+end
+
+function AMG_rootnode_flops(input::package, amg_cycle::String, num_cycles::Int64)
+
+    try
+        amg_cycle = string(amg_cycle)
+
+        sp = PythonCall.pyimport("scipy.sparse")
+        amg = _get_vendored_pyamg()
+        np = PythonCall.pyimport("numpy")
+
+        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
+        A = sp.csr_matrix(
+            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
+            shape = size(input.A),
+        )
+
+        ml = amg.rootnode_solver(A)
+
+        temp = np.zeros(size(input.A, 1))
+        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
+            y .= PythonCall.PyArray(
+                ml.solve(
+                    PythonCall.PyArray(temp) .= x,
+                    maxiter = num_cycles,
+                    cycle = amg_cycle,
+                    tol = 1e-16,
+                ),
+            )
+        end
+
+        num_multiplications =
+            PythonCall.pyconvert(
+                Int64,
+                PythonCall.pybuiltins.round(
+                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
+                ),
+            ) * num_cycles
+
+        # Get generation work from setup_complexity() (numerical_work, graph_work)
+        setup_work = ml.setup_complexity()
+        numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
+        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
+        nnz_A = nnz(input.A)
+        generation_work = (numerical_work) * nnz_A
+
+        println(
+            "Created AMG Root-Node Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
+        )
+        return Preconditioner(LinearOperator, num_multiplications, generation_work, input)
+    catch y
+        println(
+            "Error creating AMG Root-Node Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
         )
         rethrow(y)
     end
