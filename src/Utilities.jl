@@ -771,10 +771,29 @@ function load_matrix(filename::String, reordering::String, SPD::Bool = true)
     # Pad the diagonal
     A_Scaled_Padded = copy(A_Scaled)
     if !A_Scaled_SDD && !A_SDD
+        sqrt_eps = sqrt(eps(1.0))
+        maximum_defect = 0.0
+        diagonals = zeros(Int32, size(A_Scaled, 1))
         for i in axes(A_Scaled_Padded, 2)
-            temp = sum(abs, view(A_Scaled_Padded, :, i))
-            if 2 * A_Scaled_Padded[i, i] < temp
-                A_Scaled_Padded[i, i] = temp + eps(1.0)
+            diagonal_value = 0.0
+            row_sum = 0.0
+            for j = A_Scaled_Padded.colptr[i]:(A_Scaled_Padded.colptr[i+1]-1)
+                if A_Scaled_Padded.rowval[j] == i
+                    diagonal_value = A_Scaled_Padded.nzval[j]
+                    diagonals[i] = j
+                else
+                    row_sum += abs(A_Scaled_Padded.nzval[j])
+                end
+            end
+            # row_sum now contains the sum of the absolute values of the off-diagonal entries
+            defect = row_sum - diagonal_value
+            # if defect is negative, then the row is diagonally dominant.
+            # if defect is positive, then we need to pad the diagonal by at least defect
+            maximum_defect = max(maximum_defect, defect)
+        end
+        if maximum_defect > 0.0
+            for i in axes(A_Scaled_Padded, 2)
+                A_Scaled_Padded.nzval[diagonals[i]] += maximum_defect + sqrt_eps
             end
         end
         println("Created scaled and padded version of $(filename)")
