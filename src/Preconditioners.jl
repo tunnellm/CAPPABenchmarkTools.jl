@@ -1,2600 +1,1812 @@
 module Preconditioners
 
-using ..Algorithms: sparse_triangular_solve
-using ..Utilities:
-    norm_information, make_augmented, laplace_to_adj, problem_interface, package
+using ..Utilities: reduce_to_laplacian, laplace_to_adj, estimate_eigrange, tridiag_eigvals!
+using ..PreconditionerTypes: Preconditioner, OptionedPreconditioner
+using ..Hypre: HypreBoomerAMG, HypreFSAI, HypreCheby, HypreParaSails, HypreSchwarz
+using ..ThreadedUtilities: threaded_spmv!, _sleep_julia_workers!, _sleep_julia_workers_for_blas!
 
 using SparseArrays
 using LinearAlgebra
 using Statistics
+using Random
+using StableRNGs
+
+import PythonCall
 
 import Laplacians
-import CombinatorialMultigrid
-using LDLFactorizations
 
-import RandomizedPreconditioners
-import LimitedLDLFactorizations
+const EXTERNAL_DIR = joinpath(@__DIR__, "..", "External")
+include(joinpath(EXTERNAL_DIR, "FastSSAI3", "src", "FastSSAI3.jl"))
+using .FastSSAI3: ssai3
+include(joinpath(EXTERNAL_DIR, "LimitedLDLFactorizations", "src", "LimitedLDLFactorizations.jl"))
+import .LimitedLDLFactorizations as LLDL
+include(joinpath(EXTERNAL_DIR, "ILUK", "src", "ILUK.jl"))
+import .ILUK
 
-import CondaPkg
-import PythonCall
-import MATLAB
+export Preconditioner, OptionedPreconditioner
+export LaplaciansDeg, LaplaciansGiven, LaplaciansWdeg, LaplaciansRandom
+export PyAMGRuStu, PyAMGSmAgg, PyAMGRootnode, PyAMGPairwise
+export Control, TruncatedNeumann, TruncatedNeumannAdaptive
+export Chebyshev, ChebyshevAdaptive, SSOR, SGS, SSAI
+export LimitedLDLShiftPD, LimitedLDLAbsPD
+export ILUKShiftPD, ILUKAbsPD
+export HypreBoomerAMG, HypreFSAI, HypreCheby, HypreParaSails, HypreSchwarz
 
-using CSV
-using DataFrames
-using Random
-
-include("Dependencies.jl")
-using .Dependencies: LimitedLDLFactorizationsFlops, FastSSAI, ILUKFlops
-
-export Preconditioner  # Preconditioner
-export Control  # Identity
-export TruncatedNeumann  # Truncated Neumann
-export SOR, SSOR, GaussSeidel, SymmetricGaussSeidel  # Iterative methods
-export IncompleteCholesky, ModifiedIncompleteCholesky  # Incomplete Cholesky (MATLAB)
-export SuperILU, SuperLLT  # SuperLU
-export SymmetricSPAI  # Saunders (MATLAB)
-export SSAI  # FastSSAI3 (Julia)
-export AMG_rube_stuben, AMG_smoothed_aggregation  # PyAmg
-export AMG_ruge_stuben_flops, AMG_smoothed_aggregation_flops, AMG_rootnode_flops  # PyAmg (vendored, with work tracking)
-export LaplaceStripped, LaplaceStrippedFlops # Laplacians.jl
-export CombinatorialMG  # CombinatorialMultigrid.jl
-export SteepestDescent  # Basic iterative method
-export RandomizedNystrom, LimitedLDL, LimitedLDLShiftPD, LimitedLDLAbsPD
-export ILUKShiftPD, ILUKAbsPD  # ILUK (Julia)
-export conda_install_dependencies, install_vendored_pyamg
-
-# Path to the dependencies directory, used for locating external scripts and data files.
-const EXT = joinpath(@__DIR__, "..", "External")
 
 """
-    Preconditioner(LinearOperator::Function, num_multiplications::UInt64, system::package)
+    LaplaciansDeg(A; split=0, merge=0) -> Preconditioner
 
-Represents a preconditioner for an iterative solver.
+Approximate Cholesky preconditioner using greedy minimum-degree ordering.
 
-# Arguments
-- `LinearOperator::Function`: A function that applies the preconditioner to a given vector.
-- `num_multiplications::UInt64`: The estimated number of nonzero multiplications performed by the preconditioner.
-- `generation_work::Float64`: An estimate of the computational work required to generate the preconditioner. If unknown, use `Inf`.
-- `system::package`: The system associated with the preconditioner, including the matrix and problem metadata.
+The matrix `A` is automatically reduced to a graph Laplacian via
+`reduce_to_laplacian` (SDDM ground node or SDD double cover), then
+factored using `Laplacians.approxchol_prec_deg`.
 
-# Notes
-- The `LinearOperator` function takes a solution vector and a right-hand side vector as inputs and modifies the solution in place.
-- `num_multiplications` provides a measure of the computational cost of applying the preconditioner.
-- `generation_work::Float64` provides an estimate of the computational work required to generate the preconditioner. Inf is used when unknown.
-- This struct is used to encapsulate different types of preconditioners while maintaining a consistent interface for iterative solvers.
+`split=0` (default) uses the basic algorithm. `split>=2` enables edge
+splitting for robustness (merge is set equal to split internally).
 """
-struct Preconditioner
-    LinearOperator::Function
-    num_multiplications::UInt64
-    generation_work::Float64
-    system::package
-end
-
-function conda_install_dependencies()
-    CondaPkg.add("numpy")
-    CondaPkg.add("scipy")
-    CondaPkg.add("PyAMG")
-    CondaPkg.add("pip")
+function LaplaciansDeg(A::SparseMatrixCSC; split::Integer=0)
+    split == 1 && error("split=1 is not recommended: uses split data structures with no actual splitting. Use split=0 or split>=2.")
+    components, wrap_solver = reduce_to_laplacian(A)
+    prec, meta = _build_preconditioner(components, wrap_solver) do adj
+        Laplacians.approxchol_prec_deg(adj; split=split, merge=split)
+    end
+    meta["config"] = Dict{String,Any}("split" => split)
+    return prec, meta
 end
 
 """
-    install_vendored_pyamg()
+    LaplaciansGiven(A) -> (Preconditioner, Dict)
 
-Install the vendored pyamg fork from External/pyamg using pip in editable mode.
-This version includes setup_complexity() for tracking generation work.
-Run this once before using AMG_ruge_stuben_flops or AMG_smoothed_aggregation_flops.
-
-Note: Requires pip in the Conda environment. Run conda_install_dependencies() first if pip is missing.
+Approximate Cholesky preconditioner using fixed natural ordering.
 """
-function install_vendored_pyamg()
-    pyamg_path = joinpath(EXT, "pyamg")
-    subprocess = PythonCall.pyimport("subprocess")
-    sys = PythonCall.pyimport("sys")
+function LaplaciansGiven(A::SparseMatrixCSC)
+    components, wrap_solver = reduce_to_laplacian(A)
+    prec, meta = _build_preconditioner(components, wrap_solver) do adj
+        Laplacians.approxchol_prec_given(adj)
+    end
+    meta["config"] = Dict{String,Any}()
+    return prec, meta
+end
 
-    println("Installing vendored pyamg from $pyamg_path...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", pyamg_path, "--force-reinstall"],
-        capture_output=true,
-        text=true
-    )
+"""
+    LaplaciansWdeg(A; seed::Integer) -> (Preconditioner, Dict)
 
-    returncode = PythonCall.pyconvert(Int, result.returncode)
-    if returncode != 0
-        stderr_msg = PythonCall.pyconvert(String, result.stderr)
-        error("Failed to install vendored pyamg (exit code $returncode): $stderr_msg")
+Approximate Cholesky preconditioner using weighted-degree ordering with
+random perturbation. `seed` is required for reproducibility.
+"""
+function LaplaciansWdeg(A::SparseMatrixCSC; seed::Integer)
+    Random.seed!(seed)
+    components, wrap_solver = reduce_to_laplacian(A)
+    prec, meta = _build_preconditioner(components, wrap_solver) do adj
+        Laplacians.approxchol_prec_wdeg(adj)
+    end
+    meta["config"] = Dict{String,Any}("seed" => seed)
+    return prec, meta
+end
+
+"""
+    LaplaciansRandom(A; seed::Integer) -> (Preconditioner, Dict)
+
+Approximate Cholesky preconditioner using random permutation ordering.
+`seed` is required for reproducibility.
+"""
+function LaplaciansRandom(A::SparseMatrixCSC; seed::Integer)
+    Random.seed!(seed)
+    components, wrap_solver = reduce_to_laplacian(A)
+    prec, meta = _build_preconditioner(components, wrap_solver) do adj
+        Laplacians.approxchol_prec_random(adj)
+    end
+    meta["config"] = Dict{String,Any}("seed" => seed)
+    return prec, meta
+end
+
+"""
+    _build_preconditioner(factor_fn, components, wrap_solver) -> Preconditioner
+
+Internal helper. Factors each component's adjacency matrix using `factor_fn`,
+accumulates work counters, and wraps everything into a `Preconditioner`.
+
+`factor_fn(adj)` must return `(F!, wc, num_mults)`.
+"""
+function _build_preconditioner(factor_fn, components, wrap_solver)
+    solvers = Vector{Any}(undef, length(components))
+    total_apply_fma = UInt64(0)
+    total_gen_fma = UInt64(0)
+    total_gen_graph = UInt64(0)
+
+    for (k, (adj, _)) in enumerate(components)
+        F!, wc, num_mults = factor_fn(adj)
+        solvers[k] = F!
+        total_apply_fma += UInt64(num_mults)
+        total_gen_fma += UInt64(wc.flops)
+        total_gen_graph += UInt64(wc.graph_ops)
     end
 
-    println("Vendored pyamg installed successfully.")
+    LinearOperator = wrap_solver(solvers, total_apply_fma)
+    prec = Preconditioner(LinearOperator, total_gen_fma, total_gen_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => total_apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => total_gen_fma,
+        "generation_graph" => total_gen_graph,
+        "num_components" => length(components),
+    )
+    return prec, meta
 end
 
-# Helper to import pyamg (assumes install_vendored_pyamg was called)
-function _get_vendored_pyamg()
-    return PythonCall.pyimport("pyamg")
-end
+# ═══════════════════════════════════════════════════════════════════════════════
+# Identity (Control) Preconditioner
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    SOR(mat::problem_interface, ω::Float64, num_iters::Int64) -> Preconditioner
+    Control(A) -> (Preconditioner, Dict)
 
-Constructs a Successive Over-Relaxation (SOR) preconditioner using the scaled version of the given problem.
+Identity preconditioner: applies `z = r` with zero work.
+Useful as a baseline for benchmarking.
+"""
+function Control(A::SparseMatrixCSC)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        z .= r
+        return 0.0
+    end
+    prec = Preconditioner(apply!, UInt64(0), UInt64(0))
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => UInt64(0),
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => UInt64(0),
+        "generation_graph" => UInt64(0),
+        "config" => Dict{String,Any}(),
+    )
+    return prec, meta
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Truncated Neumann Series Preconditioner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+    TruncatedNeumann(A::SparseMatrixCSC; num_iters::Int,
+                     lanczos_k::Int, method::Symbol) -> (Preconditioner, Dict)
+
+Truncated Neumann series preconditioner using Chebyshev-optimal scaling:
+
+    M⁻¹ ≈ α · Σᵢ₌₀ᵏ (I - αA)ⁱ
+
+where α = 2/(λ_min + λ_max) is the Chebyshev center of the spectrum.
+The Chebyshev center minimizes the spectral radius ρ(I - αA), giving
+ρ = (κ-1)/(κ+1) vs ρ = 1 - 1/κ for the naive choice α = 1/λ_max.
+
+The series converges when ρ(I - αA) < 1, i.e., when all eigenvalues of A are
+positive and the spectral bounds are reasonable.
 
 # Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `ω::Float64`: The relaxation parameter. If set to `-1`, an optimal value is computed based on the Jacobi spectral radius.
-- `num_iters::Int64`: The number of SOR iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the SOR preconditioner for iterative solvers.
-
-# Notes
-- This function applies SOR on the `Scaled` version of the problem interface.
-- If `ω < 0`, an automatic computation of `ω` is performed based on the spectral properties of the matrix.
-- The preconditioner modifies an initial guess iteratively to approximate the solution.
+- `num_iters::Int`: number of Neumann terms (higher = better approximation, more work)
+- `lanczos_k::Int`: Lanczos iterations for eigenvalue estimation. Must be > 0 for
+  Lanczos-based methods, must be 0 for norm-based methods.
+- `method::Symbol`: spectral bound estimation method:
+  - `:ritz` — use extreme Ritz values directly (optimistic, tight when converged)
+  - `:conservative` — widen Ritz values by residual bounds (Bauer-Fike)
+  - `:heuristic` — λ_min = θ_min / 30 (simple safety margin)
+  - `:extrapolation` — Aitken Δ² acceleration of Ritz value sequences
+  - `:one_norm` — α = 2/‖A‖₁ (max absolute column sum, O(nnz), no Lanczos)
+  - `:frobenius` — α = 2/‖A‖_F (Frobenius norm, O(nnz), no Lanczos)
+  - `:norm_min` — α = 2/min(‖A‖₁, ‖A‖_F), both norms in one pass
+  - `:norm_safe` — α = 2/(1.1 min(‖A‖₁, ‖A‖_F))
+  - `:lanczos_ritz` — unguarded Ritz scale with the timing binary's start
+  - `:lanczos_guarded` — α = 2/(θ_min + 1.1(θ_max + ρ_max))
 """
-function SOR(mat::problem_interface, ω::Float64, num_iters::Int64)
-    return SOR(mat.Scaled, ω, num_iters)
-end
+function TruncatedNeumann(A::SparseMatrixCSC;
+                          num_iters::Int,
+                          lanczos_k::Int, method::Symbol)
+    n = size(A, 1)
+    nz = nnz(A)
 
-
-"""
-    SOR(input::package, ω::Float64, num_iters::Int64) -> Preconditioner
-
-Constructs a Successive Over-Relaxation (SOR) preconditioner for the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `ω::Float64`: The relaxation parameter. If `ω < 0`, it is automatically computed based on the Jacobi spectral radius.
-- `num_iters::Int64`: The number of SOR iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the SOR preconditioner for iterative solvers.
-
-# Notes
-- The SOR iteration updates the solution in-place using a forward sweep through the rows of `A`.
-- The function extracts the compressed sparse column (CSC) representation of `A` for efficient traversal.
-- The relaxation parameter `ω` is computed if negative, using an expression related to the spectral radius of the Jacobi iteration matrix.
-- The preconditioner applies `num_iters` sweeps over the system, modifying the initial guess iteratively.
-- The number of multiplications is estimated as `(nnz(A) + 2 * size(A, 1)) * num_iters`, accounting for all updates.
-"""
-function SOR(input::package, ω::Float64, num_iters::Int64)
-
-    ω =
-        ω < 0.0 ?
-        1.0 +
-        (
-            Float64(input.norms.jacobian) /
-            (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2))
-        )^2 : ω
-
-    ψ = 1.0 - ω
-
-    matrix = input.A
-
-    sz = size(matrix, 1)
-
-    colptr = matrix.colptr
-    rowval = matrix.rowval
-    nzval = matrix.nzval
-
-    function LinearOperator(StartingGuess, b)
-
-        StartingGuess .= 0.0
-
-        for _ = 1:num_iters
-            for i = 1:sz
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
-                end
-                StartingGuess[i] = ψ * StartingGuess[i] + (ω * (b[i] - row_sum)) / ii_val
+    norm_upper = NaN
+    if method == :norm_min || method == :norm_safe
+        @assert lanczos_k == 0 "lanczos_k must be 0 for method=:$method"
+        one_norm = 0.0
+        frobenius_sq = 0.0
+        @inbounds for col in 1:n
+            column_sum = 0.0
+            for p in A.colptr[col]:(A.colptr[col + 1] - 1)
+                value = A.nzval[p]
+                column_sum += abs(value)
+                frobenius_sq += value * value
             end
+            one_norm = max(one_norm, column_sum)
         end
-    end
-    num_multiplications = (nnz(matrix) + 2 * sz) * num_iters
-    println(
-        "Created SOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.",
-    )
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
-end
-
-
-"""
-    SteepestDescent(mat::problem_interface, num_iters::Int64) -> Preconditioner
-
-Constructs a Steepest Descent preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `num_iters::Int64`: The number of iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Steepest Descent preconditioner.
-
-# Notes
-- This function applies the Steepest Descent method on the `Scaled` version of the problem.
-- Iteratively updates the solution in the direction of the negative residual, with an adaptive step size.
-- Convergence depends on the conditioning of the system matrix.
-"""
-function SteepestDescent(mat::problem_interface, num_iters::Int64)
-    return SteepestDescent(mat.Scaled, num_iters)
-end
-
-
-"""
-    SteepestDescent(input::package, num_iters::Int64) -> Preconditioner
-
-Constructs a Steepest Descent preconditioner for the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `num_iters::Int64`: The number of iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Steepest Descent preconditioner.
-
-# Notes
-- The Steepest Descent method iteratively updates the solution in the direction of the negative residual.
-- The step size `α` is computed adaptively as `(r' * r) / (p' * r)`, where `r` is the residual and `p = A'r` is the projected residual.
-- The preconditioner modifies an initial guess iteratively to approximate the solution.
-- The number of multiplications is estimated as `nnz(A) * num_iters + 4 * size(A, 1) * num_iters - size(A, 1)`.
-"""
-function SteepestDescent(input::package, num_iters::Int64)
-
-    r = zeros(size(input.A, 1))
-    p = zeros(size(input.A, 1))
-
-    function LinearOperator(x, b)
-        x .= 0
-        r .= b
-        for _ = 1:num_iters-1
-            mul!(p, input.A', r)
-            α = (r' * r) / (p' * r)
-            x .+= α .* r
-            r .-= α .* p
-        end
-        mul!(p, input.A', r)
-        α = (r' * r) / (p' * r)
-        x .+= α .* r
+        norm_upper = min(one_norm, sqrt(frobenius_sq))
+        @assert isfinite(norm_upper) && norm_upper > 0
+        α = 2.0 / ((method == :norm_safe ? 1.1 : 1.0) * norm_upper)
+        generation_fma = UInt64(2) * UInt64(nz)
+        λ_min = NaN; λ_max = norm_upper
+        ritz_min_res = NaN; ritz_max_res = NaN
+        ritz_min_gap = NaN; ritz_max_gap = NaN
+    elseif method == :one_norm
+        @assert lanczos_k == 0 "lanczos_k must be 0 for method=:one_norm"
+        norm_val = opnorm(A, 1)
+        α = 2.0 / norm_val
+        generation_fma = UInt64(nz)
+        λ_min = NaN; λ_max = norm_val
+        ritz_min_res = NaN; ritz_max_res = NaN
+        ritz_min_gap = NaN; ritz_max_gap = NaN
+    elseif method == :frobenius
+        @assert lanczos_k == 0 "lanczos_k must be 0 for method=:frobenius"
+        _sleep_julia_workers_for_blas!()
+        norm_val = norm(A)
+        α = 2.0 / norm_val
+        generation_fma = UInt64(nz)
+        λ_min = NaN; λ_max = norm_val
+        ritz_min_res = NaN; ritz_max_res = NaN
+        ritz_min_gap = NaN; ritz_max_gap = NaN
+    else
+        @assert lanczos_k > 0 "lanczos_k must be > 0 for Lanczos-based method=:$method"
+        estimator_method = method == :lanczos_guarded ? :guarded :
+                           method == :lanczos_ritz ? :portable_ritz : method
+        λ_min, λ_max, eigrange_fma, ritz_min_res, ritz_max_res,
+            ritz_min_gap, ritz_max_gap = estimate_eigrange(A, lanczos_k;
+                                                           method = estimator_method)
+        α = method == :lanczos_guarded ?
+            2.0 / (λ_min + 1.1 * (λ_max + ritz_max_res)) :
+            2.0 / (λ_min + λ_max)
+        generation_fma = eigrange_fma
     end
 
-    num_multiplications =
-        nnz(input.A) * num_iters + 4 * size(input.A, 1) * num_iters - size(input.A, 1)
+    # Apply cost per call:
+    #   num_iters SpMVs: num_iters * nnz(A) FMA
+    #   num_iters vector updates (w - α*temp + z): 2n FMA each (fused multiply-sub + add)
+    #   final scaling (z *= α): n FMA
+    apply_fma = UInt64(num_iters) * UInt64(nz) + UInt64(2 * num_iters + 1) * UInt64(n)
 
-    println(
-        "Created Steepest Descent Preconditioner for $(input.name) with $num_iters iterations.",
-    )
+    # Workspace (closed over by apply!)
+    w    = zeros(n)
+    temp = zeros(n)
 
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
-end
-
-
-"""
-    SSOR(mat::problem_interface, ω::Float64, num_iters::Int64) -> Preconditioner
-
-Constructs a Symmetric Successive Over-Relaxation (SSOR) preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `ω::Float64`: The relaxation parameter. If set to `-1`, an optimal value is computed based on the Jacobi spectral radius.
-- `num_iters::Int64`: The number of SSOR iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the SSOR preconditioner for iterative solvers.
-
-# Notes
-- This function applies SSOR on the `Scaled` version of the problem interface.
-- The SSOR method consists of a forward sweep followed by a backward sweep to ensure symmetry.
-- If `ω < 0`, an automatic computation of `ω` is performed based on the spectral properties of the matrix.
-- The preconditioner modifies an initial guess iteratively to approximate the solution.
-"""
-function SSOR(mat::problem_interface, ω::Float64, num_iters::Int64)
-    return SSOR(mat.Scaled, ω, num_iters)
-end
-
-
-"""
-    SSOR(input::package, ω::Float64, num_iters::Int64) -> Preconditioner
-
-Constructs a Symmetric Successive Over-Relaxation (SSOR) preconditioner for the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `ω::Float64`: The relaxation parameter. If `ω == -1`, it is automatically computed based on the Jacobi spectral radius.
-- `num_iters::Int64`: The number of SSOR iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the SSOR preconditioner for iterative solvers.
-
-# Notes
-- The SSOR method consists of a forward sweep followed by a backward sweep to enforce symmetry.
-- If `ω < 0`, the relaxation parameter is computed using an expression related to the spectral radius of the Jacobi iteration matrix.
-- The function extracts the compressed sparse column (CSC) representation of `A` for efficient traversal.
-- Iteratively modifies the solution estimate using `num_iters` sweeps.
-- The total number of multiplications is estimated as `2 * (nnz(A) + 2 * size(A, 1)) * num_iters`, accounting for both forward and backward passes.
-"""
-function SSOR(input::package, ω::Float64, num_iters::Int64)
-
-    ω =
-        ω == -1.0 ?
-        1.0 +
-        (
-            Float64(input.norms.jacobian) /
-            (1.0 + sqrt(1.0 - Float64(input.norms.jacobian)^2))
-        )^2 : ω
-
-    ψ = 1.0 - ω
-
-    matrix = input.A
-
-    sz = size(matrix, 1)
-
-    colptr = matrix.colptr
-    rowval = matrix.rowval
-    nzval = matrix.nzval
-
-    function LinearOperator(StartingGuess, b)
-        StartingGuess .= 0
-        @inbounds for _ = 1:num_iters
-            for i = 1:sz
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
-                end
-                StartingGuess[i] = ψ * StartingGuess[i] + (ω * (b[i] - row_sum)) / ii_val
+    apply! = let A = A, α = α, apply_fma = apply_fma, n = n, num_iters = num_iters,
+                 temp = temp, w = w
+        function apply_inner(z::Vector{Float64}, r::Vector{Float64})::UInt64
+            @inbounds for i in 1:n
+                w[i] = r[i]
+                z[i] = r[i]
             end
-            for i = sz:-1:1
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
+            for _ in 1:num_iters
+                threaded_spmv!(temp, A, z)
+                @inbounds for i in 1:n
+                    z[i] = w[i] + z[i] - α * temp[i]
                 end
-                StartingGuess[i] = ψ * StartingGuess[i] + (ω * (b[i] - row_sum)) / ii_val
             end
-        end
-    end
-    num_multiplications = 2 * (nnz(matrix) + 2 * sz) * num_iters
-    println(
-        "Created SSOR Preconditioner for $(input.name) with ω = $ω and $num_iters iterations.",
-    )
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
-end
-
-
-"""
-    GaussSeidel(mat::problem_interface, num_iters::Int64) -> Preconditioner
-
-Constructs a Gauss-Seidel preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `num_iters::Int64`: The number of iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Gauss-Seidel preconditioner.
-
-# Notes
-- This function applies Gauss-Seidel on the `Scaled` version of the problem interface.
-- Gauss-Seidel iteratively updates the solution by performing a forward sweep through the rows of `A`.
-- Convergence depends on the spectral properties of the system matrix.
-"""
-function GaussSeidel(mat::problem_interface, num_iters::Int64)
-    return GaussSeidel(mat.Scaled, num_iters)
-end
-
-
-"""
-    GaussSeidel(input::package, num_iters::Int64) -> Preconditioner
-
-Constructs a Gauss-Seidel preconditioner for the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `num_iters::Int64`: The number of Gauss-Seidel iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Gauss-Seidel preconditioner for iterative solvers.
-
-# Notes
-- The Gauss-Seidel method iteratively updates the solution using a forward sweep through the rows of `A`.
-- Each iteration modifies the solution `x` in place based on the equation:
-    `xᵢ = (bᵢ - Σ Aᵢⱼ xⱼ) / Aᵢᵢ`
-    where `Σ` sums over all `j ≠ i`.
-- The function extracts the compressed sparse column (CSC) representation of `A` for efficient traversal.
-- The preconditioner applies `num_iters` forward sweeps over the system.
-- The total number of multiplications is estimated as `nnz(A) * num_iters`.
-"""
-function GaussSeidel(input::package, num_iters::Int64)
-
-    matrix = input.A
-
-    sz = size(matrix, 1)
-
-    colptr = matrix.colptr
-    rowval = matrix.rowval
-    nzval = matrix.nzval
-
-    function LinearOperator(StartingGuess, b)
-        StartingGuess .= 0.0
-        @inbounds for _ = 1:num_iters
-            for i = 1:sz
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
-                end
-                StartingGuess[i] = (b[i] - row_sum) / ii_val
+            @inbounds for i in 1:n
+                z[i] *= α
             end
+            return apply_fma
         end
-    end
-    num_multiplications = nnz(matrix) * num_iters
-    println(
-        "Created Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.",
-    )
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
-end
-
-
-"""
-    SymmetricGaussSeidel(mat::problem_interface, num_iters::Int64) -> Preconditioner
-
-Constructs a Symmetric Gauss-Seidel preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `num_iters::Int64`: The number of iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Symmetric Gauss-Seidel preconditioner.
-
-# Notes
-- This function applies Symmetric Gauss-Seidel on the `Scaled` version of the problem interface.
-- The method consists of a forward sweep followed by a backward sweep to enforce symmetry.
-- Convergence depends on the spectral properties of the system matrix.
-"""
-function SymmetricGaussSeidel(mat::problem_interface, num_iters::Int64)
-    return SymmetricGaussSeidel(mat.Scaled, num_iters)
-end
-
-
-"""
-    SymmetricGaussSeidel(input::package, num_iters::Int64) -> Preconditioner
-
-Constructs a Symmetric Gauss-Seidel preconditioner for the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `num_iters::Int64`: The number of iterations to perform.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Symmetric Gauss-Seidel preconditioner.
-
-# Notes
-- The Symmetric Gauss-Seidel method consists of a forward sweep followed by a backward sweep to enforce symmetry.
-- Each iteration modifies the solution `x` using:
-    `xᵢ = (bᵢ - Σ Aᵢⱼ xⱼ) / Aᵢᵢ`
-where `Σ` sums over all `j ≠ i`.
-- The function extracts the compressed sparse column (CSC) representation of `A` for efficient traversal.
-- Applies `num_iters` symmetric sweeps over the system.
-- The total number of multiplications is estimated as `2 * nnz(A) * num_iters`, accounting for both forward and backward passes.
-"""
-
-function SymmetricGaussSeidel(input::package, num_iters::Int64)
-
-    matrix = input.A
-
-    colptr = matrix.colptr
-    rowval = matrix.rowval
-    nzval = matrix.nzval
-
-    sz = size(matrix, 1)
-    function LinearOperator(StartingGuess, b)
-        StartingGuess .= 0.0
-        @inbounds for _ = 1:num_iters
-            for i = 1:sz
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
-                end
-                StartingGuess[i] = (b[i] - row_sum) / ii_val
-            end
-            for i = sz:-1:1
-                row_sum = 0.0
-                ii_val = 0.0
-                for j = colptr[i]:colptr[i+1]-1
-                    idx = rowval[j]
-                    if idx == i
-                        ii_val = nzval[j]
-                    else
-                        row_sum += nzval[j] * StartingGuess[idx]
-                    end
-                end
-                StartingGuess[i] = (b[i] - row_sum) / ii_val
-            end
-        end
-    end
-    num_multiplications = 2 * nnz(matrix) * num_iters
-    println(
-        "Created Symmetric Gauss-Seidel Preconditioner for $(input.name) with $num_iters iterations.",
-    )
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
-end
-
-
-"""
-    IncompleteCholesky(mat::problem_interface, drop_tol::Float64, fill::Int64, michol::Bool=false) -> Preconditioner
-
-Constructs an Incomplete Cholesky (IC) preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `drop_tol::Float64`: The drop tolerance, controlling the sparsity of the factorization.
-- `fill::Int64`: The level of fill-in allowed in the factorization. If `-1`, a no-fill version is used.
-- `michol::Bool` (optional, default `false`): If `true`, enables modified incomplete Cholesky (MIC) factorization.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Incomplete Cholesky preconditioner.
-
-# Notes
-- This function applies Incomplete Cholesky on the `Scaled` version of the problem interface.
-- If `fill == -1`, the factorization is performed without additional fill-in.
-- The MIC variant is enabled when `michol` is set to `true`, modifying the factorization to improve numerical stability.
-- This function serves as a wrapper for calling the MATLAB-based Incomplete Cholesky implementation.
-"""
-function IncompleteCholesky(
-    mat::problem_interface,
-    drop_tol::Float64,
-    fill::Int64,
-    michol::Bool = false,
-)
-    return IncompleteCholesky(mat.Scaled, drop_tol, fill, michol)
-end
-
-
-"""
-    IncompleteCholesky(input::package, drop_tol::Float64, fill::Int64, michol::Bool=false) -> Preconditioner
-
-Constructs an Incomplete Cholesky (IC) preconditioner using MATLAB's `ichol` function.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `drop_tol::Float64`: Drop tolerance controlling the sparsity of the factorization.
-- `fill::Int64`: Level of fill-in allowed. If `-1`, a no-fill version is used.
-- `michol::Bool` (optional, default `false`): If `true`, enables the modified Incomplete Cholesky (MIC) factorization.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Incomplete Cholesky preconditioner.
-
-# Notes
-- This function requires MATLAB and calls `ichol(A, options)`.
-- If `fill == -1`, the no-fill variant of `ichol` is used.
-- The factorized matrix `u` is retrieved from MATLAB and its transpose `l` is used for solving.
-- The preconditioner applies a sparse triangular solve using `l` and `u`.
-- The function ensures that the MATLAB session is properly managed, closing it after execution.
-"""
-function IncompleteCholesky(
-    input::package,
-    drop_tol::Float64,
-    fill::Int64,
-    michol::Bool = false,
-)
-
-    local session
-    try
-        session = MATLAB.MSession(0)
-    catch e
-        println("Error creating MATLAB session.")
-        rethrow(e)
+        apply_inner
     end
 
-    try
-
-        MATLAB.put_variable(session, :A, input.A)
-
-        eval_string = ""
-
-        if fill == -1
-            eval_string *= "options.type = 'nofill'; "
-        else
-            eval_string *= "options.type = 'ict'; "
-            eval_string *= "options.droptol = $drop_tol; "
-        end
-        eval_string *= "options.michol = $(michol ? "\'on\'" : "\'off\'");"
-
-        MATLAB.eval_string(session, eval_string)
-        MATLAB.eval_string(session, "u = ichol(A, options);")
-
-        u = MATLAB.get_mvariable(session, :u) |> MATLAB.jsparse
-        l = copy(transpose(u))
-
-        function LinearOperator(y, r)
-            y .= sparse_triangular_solve(l, u, r)
-        end
-        num_multiplications = 2 * nnz(u)
-
-        # the following is a coarse approximation of generation work. This will be an undercount for thresholded factorizations.
-        generation_work = sum(x -> x^2, u.colptr[2:end] .- u.colptr[1:end-1])
-
-        println("Created Incomplete Cholesky Preconditioner for $(input.name).")
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(generation_work),
-            input,
-        )
-    catch y
-        println("Error creating the Incomplete Cholesky Preconditioner for $(input.name).")
-        rethrow(y)
-    finally
-        MATLAB.close(session)
-    end
-end
-
-"""
-    ModifiedIncompleteCholesky(mat::problem_interface, drop_tol::Float64, fill::Int64) -> Preconditioner
-
-Constructs a Modified Incomplete Cholesky (MIC) preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `drop_tol::Float64`: Drop tolerance controlling the sparsity of the factorization.
-- `fill::Int64`: Level of fill-in allowed. If `-1`, a no-fill version is used.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Modified Incomplete Cholesky preconditioner.
-
-# Notes
-- This function is a wrapper around `IncompleteCholesky`, enabling the `michol` option.
-- The MIC variant improves numerical stability by modifying the diagonal entries during factorization.
-- The factorization is applied to the `Scaled` version of the problem.
-"""
-function ModifiedIncompleteCholesky(mat::problem_interface, drop_tol::Float64, fill::Int64)
-    return IncompleteCholesky(mat, drop_tol, fill, true)
-end
-
-
-"""
-    SuperILU(mat::problem_interface, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL") -> Preconditioner
-
-Constructs an incomplete LU (ILU) preconditioner using SuperLU, applied to the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `drop_tolerance::Float64`: Drop tolerance controlling the sparsity of the ILU factorization.
-- `fill::Int64`: Level of fill-in allowed in the factorization. Must be between `1` and `10`.
-- `ordering::String` (optional, default `"NATURAL"`): Column ordering strategy for factorization. Must be one of `"NATURAL"`, `"MMD_ATA"`, or `"MMD_AT_PLUS_A"`.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the ILU preconditioner.
-
-# Notes
-- This function applies ILU on the `Scaled` version of the problem.
-- The preconditioner is constructed using SuperLU's `spilu` function from SciPy.
-- The ILU factors returned are **not necessarily symmetric**, even if the input matrix is symmetric.
-- The function checks that `fill` is within the allowed range and throws an error otherwise.
-- The number of multiplications is estimated as the total number of nonzeros in the ILU factors.
-"""
-function SuperILU(
-    mat::problem_interface,
-    drop_tolerance::Float64,
-    fill::Int64,
-    ordering::String = "NATURAL",
-)
-    return SuperILU(mat.Scaled, drop_tolerance, fill, ordering)
-end
-
-
-"""
-    SuperILU(input::package, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL") -> Preconditioner
-
-Constructs an incomplete LU (ILU) preconditioner using SuperLU, applied to the given system.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `drop_tolerance::Float64`: Drop tolerance controlling the sparsity of the ILU factorization.
-- `fill::Int64`: Level of fill-in allowed in the factorization. Must be between `1` and `10`.
-- `ordering::String` (optional, default `"NATURAL"`): Column ordering strategy for factorization. Must be one of `"NATURAL"`, `"MMD_ATA"`, or `"MMD_AT_PLUS_A"`.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the ILU preconditioner.
-
-# Notes
-- This function applies ILU on `input.A` using the SuperLU `spilu` function from SciPy.
-- The ILU factorization is controlled by the `drop_tolerance` and `fill` parameters, determining sparsity and accuracy.
-- The function ensures `fill` is within the allowed range and raises an error otherwise.
-- The matrix is converted into SciPy's compressed sparse column (CSC) format before factorization.
-- The preconditioner solves systems using the SuperLU `ilu.solve` function.
-- The number of multiplications is estimated as the sum of nonzeros in `L` and `U`, capturing the factorization complexity.
-"""
-function SuperILU(
-    input::package,
-    drop_tolerance::Float64,
-    fill::Int64,
-    ordering::String = "NATURAL",
-)
-
-    ordering = uppercase(ordering)
-
-    @assert ordering ∈ ["NATURAL", "MMD_ATA", "MMD_AT_PLUS_A"]
-
-    # Assert that fill is between 1 and 10
-    if fill < 1 || fill > 10
-        throw(ArgumentError("Fill must be between 1 and 10"))
-    end
-
-    scipy = PythonCall.pyimport("scipy.sparse")
-    # Convert the matrix to a python object
-    A = scipy.csc_matrix(
-        (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-        shape = size(input.A),
-    )
-    dc = PythonCall.pybuiltins.dict
-    ilu = scipy.linalg.spilu(
-        A,
-        fill_factor = fill,
-        drop_tol = drop_tolerance,
-        # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
-        options = dc(
-            Equil = false,
-            RowPerm = "NOROWPERM",
-            ColPerm = ordering,
-            # ColPerm="MMD_AT_PLUS_A",
-            # ColPerm="MMD_AT_PLUS_A",
-            # SymmetricMode=true,
-            DiagPivotThresh = 0.0,
+    prec = Preconditioner(apply!, UInt64(generation_fma), UInt64(0))
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => UInt64(generation_fma),
+        "generation_graph" => UInt64(0),
+        "lambda_min" => λ_min,
+        "lambda_max" => λ_max,
+        "alpha" => α,
+        "norm_upper" => norm_upper,
+        "guard_factor" => method in (:norm_safe, :lanczos_guarded) ? 1.1 : 1.0,
+        "ritz_min_residual" => ritz_min_res,
+        "ritz_max_residual" => ritz_max_res,
+        "ritz_min_half_gap" => ritz_min_gap,
+        "ritz_max_half_gap" => ritz_max_gap,
+        "config" => Dict{String,Any}(
+            "num_iters" => num_iters,
+            "lanczos_k" => lanczos_k,
+            "method" => String(method),
         ),
     )
-    function LinearOperator(y, r)
-        y .= ilu.solve(r)
-    end
-    num_multiplications = ilu.L.nnz + ilu.U.nnz
-
-    # Estimate the generation work as the sum of nonzeros in L and U
-    # This is a coarse approximation, as it does not account for thresholding effects.
-    generation_work = sum(
-        x -> x,
-        (ilu.L.colptr[2:end] .- ilu.L.colptr[1:end-1]) .*
-        (ilu.U.colptr[2:end] .- ilu.U.colptr[1:end-1]),
-    )
-
-    println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(
-        LinearOperator,
-        num_multiplications,
-        Float64(generation_work),
-        input,
-    )
-end
-
-
-"""
-    SuperLLT(mat::problem_interface, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL") -> Preconditioner
-
-Constructs an incomplete Cholesky-like factorization (`LLᵀ`) preconditioner using SuperLU, applied to the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `drop_tolerance::Float64`: Drop tolerance controlling the sparsity of the factorization.
-- `fill::Int64`: Level of fill-in allowed in the factorization. Must be between `1` and `10`.
-- `ordering::String` (optional, default `"NATURAL"`): Column ordering strategy for factorization. Must be one of `"NATURAL"`, `"MMD_ATA"`, or `"MMD_AT_PLUS_A"`.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the `LLᵀ` preconditioner.
-
-# Notes
-- This function applies the factorization on the `Scaled` version of the problem.
-- The factorization is computed using SuperLU's `spilu` function, but only the `L^T` factor is used for preconditioning, which results in a symmetric preconditioner.
-- The resulting factors are **not necessarily symmetric**, even if the input matrix is symmetric.
-- The function checks that `fill` is within the allowed range and throws an error otherwise.
-"""
-function SuperLLT(
-    mat::problem_interface,
-    drop_tolerance::Float64,
-    fill::Int64,
-    ordering::String = "NATURAL",
-)
-    return SuperLLT(mat.Scaled, drop_tolerance, fill, ordering)
+    return prec, meta
 end
 
 """
-    SuperLLT(input::package, drop_tolerance::Float64, fill::Int64, ordering::String="NATURAL") -> Preconditioner
+    TruncatedNeumannAdaptive(A::SparseMatrixCSC; num_iters::Int,
+                              lanczos_k::Symbol, method::Symbol) -> (Preconditioner, Dict)
 
-Constructs an incomplete Cholesky-like factorization (`LLᵀ`) preconditioner using SuperLU, applied to the given system.
+Adaptive wrapper around `TruncatedNeumann` that computes `lanczos_k` from the
+matrix dimension.
 
 # Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `drop_tolerance::Float64`: Drop tolerance controlling the sparsity of the factorization.
-- `fill::Int64`: Level of fill-in allowed in the factorization. Must be between `1` and `10`.
-- `ordering::String` (optional, default `"NATURAL"`): Column ordering strategy for factorization. Must be one of `"NATURAL"`, `"MMD_ATA"`, or `"MMD_AT_PLUS_A"`.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the `LLᵀ` preconditioner.
-
-# Notes
-- This function applies an incomplete factorization on `input.A` using SuperLU's `spilu` function.
-- The ILU factorization is computed with `SymmetricMode=true`, but **the resulting factors are not necessarily symmetric**, even if `A` is symmetric.
-- The `L` factor is used for preconditioning, scaled by the diagonal of `U`, resulting in a symmetric preconditioner.
-- The function ensures `fill` is within the allowed range and raises an error otherwise.
-- The preconditioner solves systems using a sparse triangular solve with `L'` and `L^T`.
-- The total number of multiplications is estimated as `2 * nnz(U)`, accounting for forward and backward solves.
+- `num_iters::Int`: number of Neumann terms
+- `lanczos_k::Symbol`: adaptive scheme for Lanczos iteration count:
+  - `:log2_scaled` — `ceil(30 * log2(n))`, grows slowly with dimension
+- `method::Symbol`: spectral bound estimation method (see `TruncatedNeumann`)
 """
-function SuperLLT(
-    input::package,
-    drop_tolerance::Float64,
-    fill::Int64,
-    ordering::String = "NATURAL",
-)
-
-    ordering = uppercase(ordering)
-
-    @assert ordering ∈ ["NATURAL", "MMD_ATA", "MMD_AT_PLUS_A"]
-
-    # Assert that fill is between 1 and 10
-    if fill < 1 || fill > 10
-        throw(ArgumentError("Fill must be between 1 and 10"))
+function TruncatedNeumannAdaptive(A::SparseMatrixCSC;
+                                   num_iters::Int, lanczos_k::Symbol,
+                                   method::Symbol)
+    n = size(A, 1)
+    if method in (:one_norm, :frobenius, :norm_min, :norm_safe)
+        k = 0
+    elseif lanczos_k == :log2_scaled
+        k = ceil(Int, 30 * log2(n))
+    else
+        error("Unknown adaptive lanczos_k: $lanczos_k")
     end
+    prec, meta = TruncatedNeumann(A; num_iters=num_iters, lanczos_k=k, method=method)
+    meta["config"]["lanczos_k_scheme"] = String(lanczos_k)
+    return prec, meta
+end
 
-    scipy = PythonCall.pyimport("scipy.sparse")
-    # Convert the matrix to a python object
-    A = scipy.csc_matrix(
-        (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-        shape = size(input.A),
-    )
-    dc = PythonCall.pybuiltins.dict
-    ilu = scipy.linalg.spilu(
-        A,
-        fill_factor = fill,
-        drop_tol = drop_tolerance,
-        # options=dc(Equil=false,RowPerm="NOROWPERM", ColPerm="MMD_AT_PLUS_A",
-        options = dc(
-            Equil = false,
-            RowPerm = "NOROWPERM",
-            ColPerm = "NATURAL",
-            # ColPerm="MMD_AT_PLUS_A",
-            # ColPerm="MMD_AT_PLUS_A",
-            SymmetricMode = true,
-            DiagPivotThresh = 0.0,
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chebyshev Polynomial Preconditioner (via hypre)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+    Chebyshev(A::SparseMatrixCSC; order::Int, lanczos_k::Int,
+              method::Symbol, variant::Symbol) -> (Preconditioner, Dict)
+
+Chebyshev polynomial preconditioner using hypre's implementation with spectral
+bounds estimated via Lanczos + DSTERF.
+
+Upstream hypre clamps the requested degree to 4. Our hypre fork preserves its
+degree-1 through degree-4 implementation and extends the CPU implementation to
+higher degrees (including 8 and 16) using Chebyshev semi-iteration, with matching
+work accounting. Higher degrees are not silently replaced by degree 4.
+
+The spectral bounds [λ_min, λ_max] are computed by `estimate_eigrange` using
+the specified `method` and `lanczos_k` Lanczos iterations, then passed to
+hypre's Chebyshev solver. `eig_ratio = 0` covers the full estimated interval
+[λ_min, 1.1 × λ_max]. A positive ratio raises its lower endpoint by that
+fraction of the interval width. Older wrappers silently retained hypre's 0.3
+default; corrected runs have an explicit ratio in their configuration identity.
+
+Generation cost includes both the Lanczos eigenvalue estimation and hypre's
+polynomial coefficient setup. Apply cost is reported by hypre.
+
+# Arguments
+- `order::Int`: Chebyshev polynomial degree
+- `eig_ratio::Real = 0.0`: lower-endpoint interpolation fraction in [0, 1]
+- `lanczos_k::Int`: Lanczos iterations for eigenvalue estimation (must be > 0)
+- `method::Symbol`: eigenvalue estimation method — `:ritz`, `:conservative`,
+  `:heuristic`, or `:extrapolation`
+- `variant::Symbol`: Chebyshev polynomial variant:
+  - `:standard_residual` — standard Chebyshev residual polynomial r(t) = 1 - t·s(t)
+  - `:alternative` — for degree m >= 2, the degree-(m-1) normalized Chebyshev
+    residual polynomial times `(1 - t/upper_bound)`; degree 1 uses `1 - t/theta`
+"""
+function Chebyshev(A::SparseMatrixCSC;
+                   order::Int,
+                   lanczos_k::Int, method::Symbol,
+                   variant::Symbol, eig_ratio::Real = 0.0)
+    @assert lanczos_k > 0 "lanczos_k must be > 0"
+    isfinite(eig_ratio) && 0 <= eig_ratio <= 1 ||
+        throw(ArgumentError("eig_ratio must be finite and in [0, 1]"))
+
+    # Estimate spectral bounds
+    λ_min, λ_max, eigrange_fma, ritz_min_res, ritz_max_res,
+        ritz_min_gap, ritz_max_gap = estimate_eigrange(A, lanczos_k; method = method)
+
+    P, cheby_apply_fma = HypreCheby(A; order = order, variant = variant, scale = false,
+                                     eig_ratio = eig_ratio, min_eig_est = λ_min, max_eig_est = λ_max)
+
+    # Sum our Lanczos cost with hypre's residual setup cost
+    total_gen_fma = eigrange_fma + P.generation_fma
+
+    prec = Preconditioner(P.LinearOperator, UInt64(total_gen_fma), P.generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => cheby_apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => UInt64(total_gen_fma),
+        "generation_graph" => P.generation_graph,
+        "lambda_min" => λ_min,
+        "lambda_max" => λ_max,
+        "ritz_min_residual" => ritz_min_res,
+        "ritz_max_residual" => ritz_max_res,
+        "ritz_min_half_gap" => ritz_min_gap,
+        "ritz_max_half_gap" => ritz_max_gap,
+        "chebyshev_implementation" => order > 4 ? "hypre_host_semi_iteration_v1" : "hypre_legacy_horner",
+        "effective_order" => order,
+        "config" => Dict{String,Any}(
+            "order" => order,
+            "eig_ratio" => Float64(eig_ratio),
+            "lanczos_k" => lanczos_k,
+            "method" => String(method),
+            "variant" => String(variant),
         ),
     )
+    return prec, meta
+end
 
-    # lp = ilu.perm_r .+ 1
-    # rp = ilu.perm_c .+ 1
+"""
+    ChebyshevAdaptive(A::SparseMatrixCSC; order::Int, lanczos_k::Symbol,
+                       method::Symbol, variant::Symbol) -> (Preconditioner, Dict)
 
-    U_ = ilu.U
-    L_ = ilu.L
+Adaptive wrapper around `Chebyshev` that computes `lanczos_k` from the
+matrix dimension.
 
-    U = SparseMatrixCSC(
-        PythonCall.pyconvert(Tuple{Int64,Int64}, U_.shape)...,
-        PythonCall.pyconvert(Vector{Int64}, U_.indptr) .+ 1,
-        PythonCall.pyconvert(Vector{Int64}, U_.indices) .+ 1,
-        PythonCall.pyconvert(Vector{Float64}, U_.data),
-    )
-
-    L = SparseMatrixCSC(
-        PythonCall.pyconvert(Tuple{Int64,Int64}, L_.shape)...,
-        PythonCall.pyconvert(Vector{Int64}, L_.indptr) .+ 1,
-        PythonCall.pyconvert(Vector{Int64}, L_.indices) .+ 1,
-        PythonCall.pyconvert(Vector{Float64}, L_.data),
-    )
-
-    # We can use U too, but L appears to work better in practice.
-    # To use U, we need to remove half of the scaling.
-    # dia = 1 ./ sqrt.(diag(U))
-    # U = Diagonal(dia) * U
-
-    # To use L, we add half of the scaling from U.
-    dia = sqrt.(diag(U))
-    L = L * Diagonal(dia)
-
-    function LinearOperator(y, r)  # recall we use the transpose here
-        y .= sparse_triangular_solve(copy(L'), copy(L), r)
+# Arguments
+- `order::Int`: Chebyshev polynomial degree
+- `lanczos_k::Symbol`: adaptive scheme for Lanczos iteration count:
+  - `:log2_scaled` — `ceil(30 * log2(n))`, grows slowly with dimension
+- `method::Symbol`: eigenvalue estimation method (see `Chebyshev`)
+- `variant::Symbol`: Chebyshev variant (see `Chebyshev`)
+- `eig_ratio::Real = 0.0`: lower-endpoint interpolation (see `Chebyshev`)
+"""
+function ChebyshevAdaptive(A::SparseMatrixCSC;
+                            order::Int, lanczos_k::Symbol,
+                            method::Symbol, variant::Symbol, eig_ratio::Real = 0.0)
+    n = size(A, 1)
+    if lanczos_k == :log2_scaled
+        k = ceil(Int, 30 * log2(n))
+    else
+        error("Unknown adaptive lanczos_k: $lanczos_k")
     end
-    num_multiplications = 2 * PythonCall.pyconvert(Int64, ilu.U.nnz)
-
-    generation_work = sum(
-        x -> x,
-        (L.colptr[2:end] .- L.colptr[1:end-1]) .* (U.colptr[2:end] .- U.colptr[1:end-1]),
-    )
-
-    println("Created SuperLU Preconditioner for $(input.name) with fill factor $fill.")
-    return Preconditioner(
-        LinearOperator,
-        num_multiplications,
-        Float64(generation_work),
-        input,
-    )
+    prec, meta = Chebyshev(A; order=order, lanczos_k=k, method=method, variant=variant, eig_ratio=eig_ratio)
+    meta["config"]["lanczos_k_scheme"] = String(lanczos_k)
+    return prec, meta
 end
 
-
-"""
-    TruncatedNeumann(mat::problem_interface, num_iters::Int64, norm::Float64) -> Preconditioner
-
-Constructs a Truncated Neumann series preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `num_iters::Int64`: The number of iterations for the truncated Neumann series expansion.
-- `norm_::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Truncated Neumann preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- The preconditioner approximates the inverse of `A` using a truncated Neumann series expansion:
-    `M⁻¹ ≈ α (I - αA + α²A² - … + αⁿAⁿ)`
-    where `α` is chosen as `1/‖A‖` for stability.
-- If `norm == 0`, `α` is computed as `1`, otherwise `α = 1 / norm`.
-- The number of multiplications is estimated as `num_iters * nnz(A)`, accounting for all matrix-vector products.
-"""
-function TruncatedNeumann(mat::problem_interface, num_iters::Int64, norm_::Float64)
-    return TruncatedNeumann(mat.Scaled, num_iters, norm_)
+# The corrected default must not reuse a pre-fix result directory when callers
+# omit the keyword. Other preconditioners retain their existing identities.
+_preconditioner_identity_kwargs(preconditioner, kwargs) = kwargs
+function _preconditioner_identity_kwargs(
+        ::Union{typeof(Chebyshev),typeof(ChebyshevAdaptive)}, kwargs)
+    ratio = Float64(get(kwargs, "eig_ratio", 0.0))
+    isfinite(ratio) && 0 <= ratio <= 1 ||
+        throw(ArgumentError("eig_ratio must be finite and in [0, 1]"))
+    return merge(kwargs, Dict{String,Any}("eig_ratio" => ratio))
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SSOR Preconditioner
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    TruncatedNeumann(mat::problem_interface, num_iters::Int64, norm::Float64) -> Preconditioner
+    SSOR(A::SparseMatrixCSC; num_iters::Int, ω::Float64) -> Preconditioner
 
-Constructs a Truncated Neumann series preconditioner using the scaled version of the given problem.
+Symmetric Successive Over-Relaxation preconditioner on a scaled (unit diagonal)
+SPD matrix. Each iteration performs a forward then backward Gauss-Seidel sweep
+with relaxation parameter ω:
+
+    x[i] = (1-ω)·x[i] + ω·(b[i] - Σ_{j≠i} a[i,j]·x[j])
+
+(no diagonal divide since the input is assumed scaled to unit diagonal).
+
+# FMA accounting
+
+Per iteration (forward + backward sweep):
+- Off-diagonal dot products: 2·(nnz - n) FMA
+- b[i] - row_sum: 2n adds (counted as FMA)
+- ω·(...): 2n multiplies
+- (1-ω)·x[i] + ...: 2n FMA
+→ Total per iteration: 2·(nnz + n) FMA
 
 # Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `num_iters::Int64`: The number of iterations for the truncated Neumann series expansion.
-- `norm_::Float64`: The norm used for scaling. If `0`, the spectral norm is estimated and used.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Truncated Neumann preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- The preconditioner approximates the inverse of `A` using a truncated Neumann series expansion:
-    `M⁻¹ ≈ α (I - αA + α²A² - … + αⁿAⁿ)`
-where `α` is chosen as `1/‖A‖` for stability.
-- If `norm == 0`, the spectral norm is estimated, otherwise `α = 1 / norm`.
-- The function performs iterative matrix-vector multiplications to construct the preconditioner.
-- The total number of multiplications is estimated as `num_iters * nnz(A)`, accounting for all matrix-vector products.
+- `num_iters::Int`: number of SSOR iterations
+- `ω::Float64`: relaxation parameter
 """
-function TruncatedNeumann(input::package, num_iters::Int64, norm_::Float64)
+function SSOR(A::SparseMatrixCSC;
+              num_iters::Int,
+              ω::Real)
+    ω = Float64(ω)
+    n = size(A, 1)
+    nz = nnz(A)
 
-    β =
-        norm_ == -1.0 ? 0.5 * input.norms.spectral_norm :
-        norm_ == 0.0 ? 1.0 : norm(input.A, norm_)
-    α = 1.0 / β
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval  = A.nzval
 
-    w = zeros(size(input.A, 1))
-    temp = zeros(size(input.A, 1))
+    ω_val = ω
 
-    matrix = α * input.A
+    # Apply cost: 2·(nnz + n) per iteration
+    apply_fma = UInt64(2) * UInt64(nz + n) * UInt64(num_iters)
 
-    function LinearOperator(product, x)
-        w .= x
-        product .= w
-        for _ = 1:num_iters
-            mul!(temp, matrix, product)
-            product .= w .+ product .- temp
+    # Branchless inner loop: include the unit diagonal in the @simd sum,
+    # then absorb the extra ω·z[i] diagonal contribution into ψ:
+    #   z[i] = (1-ω)·z[i] + ω·(r[i] - Σ_{j≠i} a[i,j]·z[j])       (standard)
+    #        = (1-ω)·z[i] + ω·(r[i] - full_sum + z[i])             (a[i,i]=1)
+    #        = z[i] + ω·(r[i] - full_sum)                           ((1-ω)+ω=1)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        z .= 0.0
+        @inbounds for _ = 1:num_iters
+            # Forward sweep
+            for i = 1:n
+                full_sum = 0.0
+                @simd for j = colptr[i]:(colptr[i+1] - 1)
+                    full_sum = muladd(nzval[j], z[rowval[j]], full_sum)
+                end
+                z[i] = z[i] + ω_val * (r[i] - full_sum)
+            end
+            # Backward sweep
+            for i = n:-1:1
+                full_sum = 0.0
+                @simd for j = colptr[i]:(colptr[i+1] - 1)
+                    full_sum = muladd(nzval[j], z[rowval[j]], full_sum)
+                end
+                z[i] = z[i] + ω_val * (r[i] - full_sum)
+            end
         end
-        product .*= α
+        return apply_fma
     end
-    num_multiplications = num_iters * nnz(input.A)
-    println(
-        "Created Truncated Neumann Preconditioner for $(input.name) with $num_iters iterations.",
+
+    prec = Preconditioner(apply!, UInt64(0), UInt64(0))
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => UInt64(0),
+        "generation_graph" => UInt64(0),
+        "config" => Dict{String,Any}(
+            "num_iters" => num_iters,
+            "omega" => ω_val,
+        ),
     )
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
+    return prec, meta
 end
 
 
-"""
-    SymmetricSPAI(mat::problem_interface, fill_factor::Float64) -> Preconditioner
-
-Constructs a Symmetric Sparse Approximate Inverse (SPAI) preconditioner using the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `fill_factor::Float64`: The fill factor controlling the sparsity of the approximate inverse.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the Symmetric SPAI preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- The preconditioner is computed using MATLAB's `SSAI3` function, requiring MATLAB support.
-- The `fill_factor` determines the trade-off between accuracy and sparsity.
-"""
-function SymmetricSPAI(mat::problem_interface, fill_factor::Float64)
-    return SymmetricSPAI(mat.Scaled, fill_factor)
-end
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Symmetric Gauss-Seidel Preconditioner
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    SymmetricSPAI(input::package, fill_factor::Float64) -> Preconditioner
+    SGS(A::SparseMatrixCSC; num_iters::Int) -> Preconditioner
 
-Constructs a Symmetric Sparse Approximate Inverse (SPAI) preconditioner using MATLAB's `SSAI3` function.
+Symmetric Gauss-Seidel preconditioner on a scaled (unit diagonal) SPD matrix.
+This is the specialized ω=1 case of SSOR with no relaxation weighting and no
+diagonal divide, giving the minimal-cost symmetric sweep:
 
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `fill_factor::Float64`: The fill factor controlling the sparsity of the approximate inverse.
+    x[i] = b[i] - Σ_{j≠i} a[i,j]·x[j]
 
-# Returns
-- `Preconditioner`: A struct encapsulating the Symmetric SPAI preconditioner.
+# FMA accounting
 
-# Notes
-- This function applies the preconditioner to `input.A` and requires MATLAB support.
-- The preconditioner is computed using the `SSAI3` function from MATLAB, which approximates `A⁻¹`.
-- The `fill_factor` determines the trade-off between sparsity and accuracy.
-- The preconditioner applies `M' * r` as an approximate inverse application.
-- The MATLAB session is managed internally, ensuring cleanup upon failure.
+Per iteration (forward + backward sweep):
+- Off-diagonal dot products: 2·(nnz - n) FMA
+- b[i] - row_sum: 2n adds (counted as FMA)
+→ Total per iteration: 2·nnz FMA
+
+No generation cost — no Lanczos, no parameter computation.
 """
-function SymmetricSPAI(input::package, fill_factor::Float64)
+function SGS(A::SparseMatrixCSC; num_iters::Int)
+    n = size(A, 1)
+    nz = nnz(A)
 
-    local session
-    try
-        session = MATLAB.MSession(0)
-    catch e
-        println("Error creating MATLAB session.")
-        rethrow(e)
-    end
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval  = A.nzval
 
-    try
+    # Apply cost: 2·nnz per iteration
+    apply_fma = UInt64(2) * UInt64(nz) * UInt64(num_iters)
 
-        MATLAB.eval_string(session, "addpath(\"$(EXT)\")")
-
-        MATLAB.put_variable(session, :sz, Float64(size(input.A, 1)))
-        MATLAB.put_variable(
-            session,
-            :fl,
-            ceil(fill_factor * Float64(ceil(nnz(input.A) / size(input.A, 1)))),
-        )
-        MATLAB.put_variable(session, :A, input.A)
-
-        MATLAB.eval_string(session, "[M, generation_cost] = SSAI3(A, sz, fl)")
-        M = MATLAB.get_mvariable(session, :M) |> MATLAB.jsparse
-        generation_work = MATLAB.get_mvariable(session, :generation_cost) |> MATLAB.jscalar
-
-        println(generation_work)
-
-        function LinearOperator(y, r)
-            mul!(y, M', r)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        z .= 0.0
+        @inbounds for _ = 1:num_iters
+            # Forward sweep (branchless: include diagonal=1 in sum, add z[i] back)
+            for i = 1:n
+                full_sum = 0.0
+                @simd for j = colptr[i]:(colptr[i+1] - 1)
+                    full_sum = muladd(nzval[j], z[rowval[j]], full_sum)
+                end
+                z[i] = r[i] - full_sum + z[i]
+            end
+            # Backward sweep
+            for i = n:-1:1
+                full_sum = 0.0
+                @simd for j = colptr[i]:(colptr[i+1] - 1)
+                    full_sum = muladd(nzval[j], z[rowval[j]], full_sum)
+                end
+                z[i] = r[i] - full_sum + z[i]
+            end
         end
-
-        num_multiplications = nnz(M)
-
-        println(
-            "Created Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).",
-        )
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(generation_work),
-            input,
-        )
-    catch y
-        println(
-            "Error creating the Symmetric Sparse Approximate Inverse Preconditioner for $(input.name).",
-        )
-        rethrow(y)
-    finally
-        MATLAB.close(session)
+        return apply_fma
     end
+
+    prec = Preconditioner(apply!, UInt64(0), UInt64(0))
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => UInt64(0),
+        "generation_graph" => UInt64(0),
+        "config" => Dict{String,Any}(
+            "num_iters" => num_iters,
+        ),
+    )
+    return prec, meta
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SSAI — Symmetric Sparse Approximate Inverse
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    SSAI(input::problem_interface, fill_factor::Real)
+    SSAI(A::SparseMatrixCSC; fill_factor::Real) -> Preconditioner
 
-Constructs a Symmetric Sparse Approximate Inverse (SSAI) preconditioner using FastSSAI3.
+Symmetric Sparse Approximate Inverse preconditioner (SSAI3 algorithm).
+
+Computes a sparse symmetric matrix M ≈ A⁻¹ such that applying the preconditioner
+is a single SpMV: z = M · r.
 
 Algorithm by Shaked Regev and Michael Saunders, ICME, Stanford University.
 Reference: https://stanford.edu/group/SOL/reports/20SSAI.pdf
 
 # Arguments
-- `input::problem_interface`: The problem interface containing different representations of the system.
-- `fill_factor::Real`: Multiplier for average column degree to determine target fill level.
+- `fill_factor::Real`: multiplier for average column degree to determine target
+  fill level in M. Higher = denser approximation, more setup work, better quality.
 
-# Returns
-- `Preconditioner`: A struct encapsulating the SSAI preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- The `fill_factor` determines the trade-off between accuracy and sparsity.
-- Uses the optimized Julia implementation from FastSSAI3.jl.
+# FMA accounting
+- Generation: reported by FastSSAI3 (includes all Gram-Schmidt, triangular solves,
+  and column-norm precomputation)
+- Generation graph: sorting and sparsity pattern operations (reported by FastSSAI3)
+- Apply: nnz(M) FMA (single SpMV)
 """
-function SSAI(input::problem_interface, fill_factor::Real)
-    return SSAI(input.Scaled, fill_factor)
-end
+function SSAI(A::SparseMatrixCSC; fill_factor::Real)
+    result = ssai3(A; fill_factor = fill_factor)
+    M = result.M
 
-function SSAI(input::package, fill_factor::Real)
-    try
-        M, generation_work = FastSSAI.ssai3(input.A; fill_factor=fill_factor)
+    apply_fma = UInt64(result.solve_flops)
+    generation_fma = UInt64(result.flops)
+    generation_graph = UInt64(result.graph_ops)
 
-        function LinearOperator(y, r)
-            mul!(y, M, r)
-        end
-
-        num_multiplications = nnz(M)
-
-        println(
-            "Created SSAI Preconditioner for $(input.name) with fill_factor $fill_factor. FLOPs: $generation_work",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(generation_work),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating SSAI Preconditioner for $(input.name) with fill_factor $fill_factor.",
-        )
-        rethrow(e)
-    end
-end
-
-
-"""
-    AMG_rube_stuben(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Ruge-Stuben method from PyAMG, applied to the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Ruge-Stuben preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- This is a wrapper around PyAMG's Ruge-Stuben AMG implementation.
-"""
-function AMG_rube_stuben(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
-    return AMG_rube_stuben(mat, string(amg_cycle), num_cycles)
-end
-
-
-"""
-    AMG_rube_stuben(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Ruge-Stuben method from PyAMG, applied to the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::String`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Ruge-Stuben preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- This is a wrapper around PyAMG's Ruge-Stuben AMG implementation.
-"""
-function AMG_rube_stuben(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
-    return AMG_rube_stuben(mat.Scaled, string(amg_cycle), num_cycles)
-end
-
-
-"""
-    AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Ruge-Stuben method from PyAMG.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `amg_cycle::String`: The type of multigrid cycle (`"V"`, `"W"`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Ruge-Stuben preconditioner.
-
-# Notes
-- This function wraps PyAMG's `ruge_stuben_solver` for efficient multigrid preconditioning.
-- The matrix `A` is converted to a SciPy CSR format before applying the solver.
-- The preconditioner solves systems using the specified AMG cycle (`amg_cycle`) for `num_cycles` iterations.
-- The number of multiplications is estimated based on the cycle complexity and nonzero entries in the coarse-grid matrix.
-- If an error occurs, the function prints an error message and rethrows the exception.
-"""
-function AMG_rube_stuben(input::package, amg_cycle::String, num_cycles::Int64)
-
-    try
-        amg_cycle = string(amg_cycle)
-
-        sp = PythonCall.pyimport("scipy.sparse")
-        amg = PythonCall.pyimport("pyamg")
-        np = PythonCall.pyimport("numpy")
-
-        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix(
-            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-            shape = size(input.A),
-        )
-
-        ml = amg.ruge_stuben_solver(A)
-        temp = np.zeros(size(input.A, 1))
-        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(
-                ml.solve(
-                    PythonCall.PyArray(temp) .= x,
-                    maxiter = num_cycles,
-                    cycle = amg_cycle,
-                    tol = 1e-16,
-                ),
-            )
-        end
-
-        num_multiplications =
-            PythonCall.pyconvert(
-                Int64,
-                PythonCall.pybuiltins.round(
-                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
-                ),
-            ) * num_cycles
-
-        println(
-            "Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        return Preconditioner(LinearOperator, num_multiplications, Inf, input)
-    catch y
-        println(
-            "Error creating AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        rethrow(y)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        threaded_spmv!(z, M, r)
+        return apply_fma
     end
 
+    prec = Preconditioner(apply!, generation_fma, generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => generation_fma,
+        "generation_graph" => generation_graph,
+        "config" => Dict{String,Any}(
+            "fill_factor" => fill_factor,
+        ),
+    )
+    return prec, meta
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Limited-Memory LDLᵀ Preconditioners
+# ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    AMG_smoothed_aggregation(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
+    LimitedLDLShiftPD(A::SparseMatrixCSC; memory_factor::Integer, droptol::Real,
+                      max_retries::Int=20) -> (Preconditioner, Dict)
 
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggregation method from PyAMG, applied to the scaled version of the given problem.
+Limited-memory LDLᵀ preconditioner with positive definiteness enforced via
+diagonal shifting. Uses the vendored LimitedLDLFactorizations fork with
+flop and graph-op tracking.
+
+When a pivot becomes non-positive during factorization, the library adds a
+shift α to the diagonal and retries (α *= 10 each time, starting from
+√ε ≈ 1.5e-8). Up to `max_retries` attempts are made internally.
 
 # Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
+- `memory_factor::Integer`: fill factor multiplier (target nnz per column = memory_factor × avg degree)
+- `droptol::Real`: drop tolerance for incomplete factorization
+- `max_retries::Int = 20`: maximum shift-increase attempts before giving up
 
 # Returns
-- `Preconditioner`: A struct encapsulating the AMG Smoothed Aggregation preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- It is a wrapper around PyAMG's Smoothed Aggregation AMG implementation.
-- The preconditioner is constructed using PyAMG's `smoothed_aggregation_solver`, which generates a hierarchy of coarse grids for multigrid acceleration.
+- `Preconditioner`: the preconditioner
+- `Dict`: diagnostics with keys `"num_retries"`, `"α_final"`, `"factorized"`, `"method"`
 """
-function AMG_smoothed_aggregation(
-    mat::problem_interface,
-    amg_cycle::Char,
-    num_cycles::Int64,
-)
-    return AMG_smoothed_aggregation(mat, string(amg_cycle), num_cycles)
-end
-
-
-"""
-    AMG_smoothed_aggregation(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggregation method from PyAMG, applied to the scaled version of the given problem.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::String`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Smoothed Aggregation preconditioner.
-
-# Notes
-- This function applies the preconditioner to the `Scaled` version of the problem interface.
-- It is a wrapper around PyAMG's Smoothed Aggregation AMG implementation.
-- The preconditioner is constructed using PyAMG's `smoothed_aggregation_solver`, which generates a hierarchy of coarse grids for multigrid acceleration.
-"""
-function AMG_smoothed_aggregation(
-    mat::problem_interface,
-    amg_cycle::String,
-    num_cycles::Int64,
-)
-    return AMG_smoothed_aggregation(mat.Scaled, string(amg_cycle), num_cycles)
-end
-
-
-"""
-    AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggregation method from PyAMG.
-
-# Arguments
-- `input::package`: The system to be preconditioned, including the matrix `A` and metadata.
-- `amg_cycle::String`: The type of multigrid cycle (`"V"`, `"W"`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Smoothed Aggregation preconditioner.
-
-# Notes
-- This function wraps PyAMG's `smoothed_aggregation_solver` for efficient multigrid preconditioning.
-- The matrix `A` is converted to a SciPy CSR format before applying the solver.
-- The preconditioner solves systems using the specified AMG cycle (`amg_cycle`) for `num_cycles` iterations.
-- The number of multiplications is estimated based on the cycle complexity and nonzero entries in the coarse-grid matrix.
-- If an error occurs, the function prints an error message and rethrows the exception.
-"""
-function AMG_smoothed_aggregation(input::package, amg_cycle::String, num_cycles::Int64)
-
-    try
-        amg_cycle = string(amg_cycle)
-
-        sp = PythonCall.pyimport("scipy.sparse")
-        amg = PythonCall.pyimport("pyamg")
-        np = PythonCall.pyimport("numpy")
-
-        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix(
-            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-            shape = size(input.A),
-        )
-
-        ml = amg.smoothed_aggregation_solver(A)
-
-        temp = np.zeros(size(input.A, 1))
-        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(
-                ml.solve(
-                    PythonCall.PyArray(temp) .= x,
-                    maxiter = num_cycles,
-                    cycle = amg_cycle,
-                    tol = 1e-16,
-                ),
-            )
-        end
-
-        num_multiplications =
-            PythonCall.pyconvert(
-                Int64,
-                PythonCall.pybuiltins.round(
-                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
-                ),
-            ) * num_cycles
-
-        println(
-            "Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        return Preconditioner(LinearOperator, num_multiplications, Inf, input)
-    catch y
-        println(
-            "Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        rethrow(y)
-    end
-end
-
-
-"""
-    AMG_ruge_stuben_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Ruge-Stuben method from the
-vendored PyAMG fork with generation work tracking via setup_complexity().
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Ruge-Stuben preconditioner with generation_work.
-"""
-function AMG_ruge_stuben_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
-    return AMG_ruge_stuben_flops(mat, string(amg_cycle), num_cycles)
-end
-
-function AMG_ruge_stuben_flops(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
-    return AMG_ruge_stuben_flops(mat.Scaled, string(amg_cycle), num_cycles)
-end
-
-function AMG_ruge_stuben_flops(input::package, amg_cycle::String, num_cycles::Int64)
-
-    try
-        amg_cycle = string(amg_cycle)
-
-        sp = PythonCall.pyimport("scipy.sparse")
-        amg = _get_vendored_pyamg()
-        np = PythonCall.pyimport("numpy")
-
-        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix(
-            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-            shape = size(input.A),
-        )
-
-        ml = amg.ruge_stuben_solver(A)
-        temp = np.zeros(size(input.A, 1))
-        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(
-                ml.solve(
-                    PythonCall.PyArray(temp) .= x,
-                    maxiter = num_cycles,
-                    cycle = amg_cycle,
-                    tol = 1e-16,
-                ),
-            )
-        end
-
-        num_multiplications =
-            PythonCall.pyconvert(
-                Int64,
-                PythonCall.pybuiltins.round(
-                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
-                ),
-            ) * num_cycles
-
-        # Get generation work from setup_complexity() (numerical_work, graph_work)
-        setup_work = ml.setup_complexity()
-        numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
-        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
-        _ = PythonCall.pyconvert(Float64, setup_work[1])
-        nnz_A = nnz(input.A)
-        generation_work = (numerical_work) * nnz_A
-
-        println(
-            "Created AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
-        )
-        return Preconditioner(LinearOperator, num_multiplications, generation_work, input)
-    catch y
-        println(
-            "Error creating AMG Ruge-Stuben Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        rethrow(y)
-    end
-
-end
-
-
-"""
-    AMG_smoothed_aggregation_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Smoothed Aggregation method from the
-vendored PyAMG fork with generation work tracking via setup_complexity().
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Smoothed Aggregation preconditioner with generation_work.
-"""
-function AMG_smoothed_aggregation_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
-    return AMG_smoothed_aggregation_flops(mat, string(amg_cycle), num_cycles)
-end
-
-function AMG_smoothed_aggregation_flops(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
-    return AMG_smoothed_aggregation_flops(mat.Scaled, string(amg_cycle), num_cycles)
-end
-
-function AMG_smoothed_aggregation_flops(input::package, amg_cycle::String, num_cycles::Int64)
-
-    try
-        amg_cycle = string(amg_cycle)
-
-        sp = PythonCall.pyimport("scipy.sparse")
-        amg = _get_vendored_pyamg()
-        np = PythonCall.pyimport("numpy")
-
-        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix(
-            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-            shape = size(input.A),
-        )
-
-        ml = amg.smoothed_aggregation_solver(A)
-
-        temp = np.zeros(size(input.A, 1))
-        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(
-                ml.solve(
-                    PythonCall.PyArray(temp) .= x,
-                    maxiter = num_cycles,
-                    cycle = amg_cycle,
-                    tol = 1e-16,
-                ),
-            )
-        end
-
-        num_multiplications =
-            PythonCall.pyconvert(
-                Int64,
-                PythonCall.pybuiltins.round(
-                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
-                ),
-            ) * num_cycles
-
-        # Get generation work from setup_complexity() (numerical_work, graph_work)
-        setup_work = ml.setup_complexity()
-        numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
-        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
-        nnz_A = nnz(input.A)
-        generation_work = (numerical_work) * nnz_A
-
-        println(
-            "Created AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
-        )
-        return Preconditioner(LinearOperator, num_multiplications, generation_work, input)
-    catch y
-        println(
-            "Error creating AMG Smoothed Aggregation Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        rethrow(y)
-    end
-end
-
-
-"""
-    AMG_rootnode_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64) -> Preconditioner
-
-Constructs an Algebraic Multigrid (AMG) preconditioner using the Root-Node method from the
-vendored PyAMG fork with generation work tracking via setup_complexity().
-
-Root-node AMG is a variant of smoothed aggregation that preserves an identity block in the
-interpolation operator. Each aggregate has a 'root-node' associated with it, which is
-injected from the coarse grid to the fine grid.
-
-# Arguments
-- `mat::problem_interface`: The problem interface containing different representations of the system.
-- `amg_cycle::Char`: The type of multigrid cycle (`'V'`, `'W'`, etc.).
-- `num_cycles::Int64`: The number of cycles to apply.
-
-# Returns
-- `Preconditioner`: A struct encapsulating the AMG Root-Node preconditioner with generation_work.
-"""
-function AMG_rootnode_flops(mat::problem_interface, amg_cycle::Char, num_cycles::Int64)
-    return AMG_rootnode_flops(mat, string(amg_cycle), num_cycles)
-end
-
-function AMG_rootnode_flops(mat::problem_interface, amg_cycle::String, num_cycles::Int64)
-    return AMG_rootnode_flops(mat.Scaled, string(amg_cycle), num_cycles)
-end
-
-function AMG_rootnode_flops(input::package, amg_cycle::String, num_cycles::Int64)
-
-    try
-        amg_cycle = string(amg_cycle)
-
-        sp = PythonCall.pyimport("scipy.sparse")
-        amg = _get_vendored_pyamg()
-        np = PythonCall.pyimport("numpy")
-
-        # Because the matrix is symmetric, we can simply pretend it is already in CSR format
-        A = sp.csr_matrix(
-            (input.A.nzval, input.A.rowval .- 1, input.A.colptr .- 1),
-            shape = size(input.A),
-        )
-
-        ml = amg.rootnode_solver(A)
-
-        temp = np.zeros(size(input.A, 1))
-        function LinearOperator(y::Vector{Float64}, x::Vector{Float64})
-            y .= PythonCall.PyArray(
-                ml.solve(
-                    PythonCall.PyArray(temp) .= x,
-                    maxiter = num_cycles,
-                    cycle = amg_cycle,
-                    tol = 1e-16,
-                ),
-            )
-        end
-
-        num_multiplications =
-            PythonCall.pyconvert(
-                Int64,
-                PythonCall.pybuiltins.round(
-                    ml.cycle_complexity(cycle = amg_cycle) * ml.levels[0].A.nnz,
-                ),
-            ) * num_cycles
-
-        # Get generation work from setup_complexity() (numerical_work, graph_work)
-        setup_work = ml.setup_complexity()
-        numerical_work = PythonCall.pyconvert(Float64, setup_work[0])
-        # We find numerical work to be a better estimate, given the relative cost of graph work in practice.
-        nnz_A = nnz(input.A)
-        generation_work = (numerical_work) * nnz_A
-
-        println(
-            "Created AMG Root-Node Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle. Generation work: $generation_work",
-        )
-        return Preconditioner(LinearOperator, num_multiplications, generation_work, input)
-    catch y
-        println(
-            "Error creating AMG Root-Node Preconditioner for $(input.name) with $(num_cycles) cycle$(num_cycles == 1 ? " " : "s ")of type $amg_cycle.",
-        )
-        rethrow(y)
-    end
-end
-
-
-function LimitedLDL(input::problem_interface, memory::Integer, droptol::Real)
-    return LimitedLDL(input.Scaled, memory, droptol)
-end
-
-function LimitedLDL(input::package, memory::Integer, droptol::Real)
-
-    nznum = (nnz(input.A) - size(input.A, 1)) / 2
-
-    nzpercol = nznum / size(input.A, 1)
-
-    memory_val = ceil(Int, nzpercol * memory)
-
-    try
-
-        ldl = LimitedLDLFactorizations.lldl(
-            input.A;
-            P = collect(1:size(input.A, 1)),
-            memory = memory_val,
-            droptol = droptol,
-        )
-
-        function LinearOperator(y, r)
-            y .= ldl \ r
-        end
-
-        num_multiplications = 2 * length(ldl.Lnzvals) + size(input.A, 1)
-
-        println(
-            "Created Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
-        )
-
-        generation_work = sum(x -> x^2, ldl.colptr[2:end] .- ldl.colptr[1:end-1])
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(generation_work),
-            input,
-        )
-
-    catch
-        println(
-            "Error creating Limited LDL Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
-        )
-        rethrow()
-    end
-end
-
-
-"""
-    LimitedLDLShiftPD(input::problem_interface, memory::Integer, droptol::Real)
-
-Constructs a Limited-Memory LDLᵀ preconditioner with positive definiteness enforced via shifting.
-Uses the vendored LimitedLDLFactorizations fork (track-flops branch) which:
-- Enforces positive definiteness by adding shifts when any diagonal entry of D becomes non-positive
-- Restarts factorization with increased shift until all diagonal entries are positive
-- Tracks the number of floating-point operations (FLOPs) during factorization
-
-Retry strategy:
-1. First try with α=0 (uses default 3 internal retries)
-2. If still fails, retry with α=1e-3, then continue with α_out until success
-
-The total FLOP count across all attempts is used as the `generation_work` metric.
-"""
-function LimitedLDLShiftPD(input::problem_interface, memory::Integer, droptol::Real)
-    return LimitedLDLShiftPD(input.Scaled, memory, droptol)
-end
-
-function LimitedLDLShiftPD(input::package, memory::Integer, droptol::Real)
-
-    nznum = (nnz(input.A) - size(input.A, 1)) / 2
-    nzpercol = nznum / size(input.A, 1)
-    memory_val = ceil(Int, nzpercol * memory)
-    n = size(input.A, 1)
+function LimitedLDLShiftPD(A::SparseMatrixCSC;
+                           memory_factor::Integer, droptol::Real,
+                           max_retries::Int = 20)
+    n = size(A, 1)
+    nzpercol = ((nnz(A) - n) / 2) / n
+    memory_val = ceil(Int, nzpercol * memory_factor)
     P = collect(1:n)
 
-    try
-        total_flops = 0
+    ldl = LLDL.lldl_spd(A; P = P, memory = memory_val, droptol = droptol,
+                         α = 0.0, max_increase_α = max_retries)
 
-        # Phase 1: Try with α=0 (default internal retries)
-        ldl = LimitedLDLFactorizationsFlops.lldl_spd(
-            input.A;
-            P = P,
-            memory = memory_val,
-            droptol = droptol,
-            α = 0.0,
-        )
-        total_flops += ldl.flops
+    LLDL.factorized(ldl) || error("LimitedLDLShiftPD failed after $(ldl.num_retries) retries, α=$(ldl.α_out)")
 
-        # Phase 2: If failed, retry with increasing α starting from 1e-3
-        α = 1e-3
-        while !LimitedLDLFactorizationsFlops.factorized(ldl)
-            ldl = LimitedLDLFactorizationsFlops.lldl_spd(
-                input.A;
-                P = P,
-                memory = memory_val,
-                droptol = droptol,
-                α = α,
-            )
-            total_flops += ldl.flops
-            α = ldl.α_out  # Use the next shift value for subsequent attempts
-        end
+    apply_fma = UInt64(ldl.solve_flops)
+    generation_fma = UInt64(ldl.flops)
+    generation_graph = UInt64(ldl.graph_ops)
 
-        function LinearOperator(y, r)
-            y .= ldl \ r
-        end
-
-        num_multiplications = 2 * length(ldl.Lnzvals) + n
-
-        println(
-            "Created Limited LDL ShiftPD Preconditioner for $(input.name) with memory $memory and droptol $droptol. Total FLOPs: $total_flops, Final α: $(ldl.α_out)",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(total_flops),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating Limited LDL ShiftPD Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
-        )
-        rethrow(e)
-    end
-end
-
-
-"""
-    LimitedLDLAbsPD(input::problem_interface, memory::Integer, droptol::Real)
-
-Constructs a Limited-Memory LDLᵀ preconditioner with positive definiteness enforced via absolute value.
-Uses the vendored LimitedLDLFactorizations fork (track-flops branch) which:
-- Performs standard (potentially indefinite) LDLᵀ factorization
-- Takes absolute value of diagonal entries D to ensure positive definiteness
-- Tracks the number of floating-point operations (FLOPs) during factorization
-
-Retry strategy:
-1. First try with α=0 (uses default 3 internal retries)
-2. If still fails (due to zero pivot), retry with α=1e-3, then continue with α_out until success
-
-The total FLOP count across all attempts is used as the `generation_work` metric.
-"""
-function LimitedLDLAbsPD(input::problem_interface, memory::Integer, droptol::Real)
-    return LimitedLDLAbsPD(input.Scaled, memory, droptol)
-end
-
-function LimitedLDLAbsPD(input::package, memory::Integer, droptol::Real)
-
-    nznum = (nnz(input.A) - size(input.A, 1)) / 2
-    nzpercol = nznum / size(input.A, 1)
-    memory_val = ceil(Int, nzpercol * memory)
-    n = size(input.A, 1)
-    P = collect(1:n)
-
-    try
-        total_flops = 0
-
-        # Phase 1: Try with α=0 (default internal retries)
-        ldl = LimitedLDLFactorizationsFlops.lldl(
-            input.A;
-            P = P,
-            memory = memory_val,
-            droptol = droptol,
-            α = 0.0,
-        )
-        total_flops += ldl.flops
-
-        # Phase 2: If failed (zero pivot), retry with increasing α starting from 1e-3
-        α = 1e-3
-        while !LimitedLDLFactorizationsFlops.factorized(ldl)
-            ldl = LimitedLDLFactorizationsFlops.lldl(
-                input.A;
-                P = P,
-                memory = memory_val,
-                droptol = droptol,
-                α = α,
-            )
-            total_flops += ldl.flops
-            α = ldl.α_out  # Use the next shift value for subsequent attempts
-        end
-
-        # Take absolute value of diagonal to enforce positive definiteness
-        ldl.D .= abs.(ldl.D)
-
-        function LinearOperator(y, r)
-            y .= ldl \ r
-        end
-
-        num_multiplications = 2 * length(ldl.Lnzvals) + n
-
-        neg_count = count(x -> x < 0, ldl.D)  # Will be 0 after abs, but check before would be useful
-        println(
-            "Created Limited LDL AbsPD Preconditioner for $(input.name) with memory $memory and droptol $droptol. Total FLOPs: $total_flops, Final α: $(ldl.α_out)",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(total_flops),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating Limited LDL AbsPD Preconditioner for $(input.name) with memory $memory and droptol $droptol.",
-        )
-        rethrow(e)
-    end
-end
-
-
-"""
-    ILUKShiftPD(input::problem_interface, k::Integer)
-
-Constructs an Incomplete LDLᵀ preconditioner with level-of-fill k and positive definiteness
-enforced via shifting. Uses the vendored ILUK fork (track-flops branch) which:
-- Enforces positive definiteness by adding shifts when pivots become non-positive
-- Restarts factorization with increased shift until all pivots are positive
-- Tracks the number of floating-point operations (FLOPs) during factorization
-
-Retry strategy:
-1. First try with α=0 (uses default 3 internal retries)
-2. If still fails, retry with α=1e-3, then continue with shift*10 until success
-
-The total FLOP count across all attempts is used as the `generation_work` metric.
-"""
-function ILUKShiftPD(input::problem_interface, k::Integer)
-    return ILUKShiftPD(input.Scaled, k)
-end
-
-function ILUKShiftPD(input::package, k::Integer)
-    n = size(input.A, 1)
-
-    try
-        total_flops = 0
-
-        # Phase 1: Try with α=0 (default internal retries with ensure_positive=true)
-        ldl = ILUKFlops.ldlt_k(
-            input.A, k;
-            α = 0.0,
-            ensure_positive = true,
-        )
-        total_flops += ldl.flops
-
-        # Phase 2: If failed, retry with increasing α starting from 1e-3
-        α = 1e-3
-        while !ldl.success
-            ldl = ILUKFlops.ldlt_k(
-                input.A, k;
-                α = α,
-                ensure_positive = true,
-            )
-            total_flops += ldl.flops
-            α = ldl.shift * 10  # Use the next shift value for subsequent attempts
-        end
-
-        function LinearOperator(y, r)
-            y .= ldl \ r
-        end
-
-        num_multiplications = 2 * nnz(ldl.L) + n
-
-        println(
-            "Created ILUK ShiftPD Preconditioner for $(input.name) with k=$k. Total FLOPs: $total_flops, Final shift: $(ldl.shift)",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(total_flops),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating ILUK ShiftPD Preconditioner for $(input.name) with k=$k.",
-        )
-        rethrow(e)
-    end
-end
-
-
-"""
-    ILUKAbsPD(input::problem_interface, k::Integer)
-
-Constructs an Incomplete LDLᵀ preconditioner with level-of-fill k and positive definiteness
-enforced via absolute value. Uses the vendored ILUK fork (track-flops branch) which:
-- Performs standard (potentially indefinite) LDLᵀ factorization
-- Takes absolute value of diagonal entries D to ensure positive definiteness
-- Tracks the number of floating-point operations (FLOPs) during factorization
-
-Retry strategy:
-1. First try with α=0 (uses default 3 internal retries)
-2. If still fails (due to zero pivot), retry with α=1e-3, then continue with shift*10 until success
-
-The total FLOP count across all attempts is used as the `generation_work` metric.
-"""
-function ILUKAbsPD(input::problem_interface, k::Integer)
-    return ILUKAbsPD(input.Scaled, k)
-end
-
-function ILUKAbsPD(input::package, k::Integer)
-    n = size(input.A, 1)
-
-    try
-        total_flops = 0
-
-        # Phase 1: Try with α=0 (default internal retries)
-        ldl = ILUKFlops.ldlt_k(
-            input.A, k;
-            α = 0.0,
-            ensure_positive = false,
-        )
-        total_flops += ldl.flops
-
-        # Phase 2: If failed (zero pivot), retry with increasing α starting from 1e-3
-        α = 1e-3
-        while !ldl.success
-            ldl = ILUKFlops.ldlt_k(
-                input.A, k;
-                α = α,
-                ensure_positive = false,
-            )
-            total_flops += ldl.flops
-            α = ldl.shift * 10  # Use the next shift value for subsequent attempts
-        end
-
-        # Take absolute value of diagonal to enforce positive definiteness
-        ldl.D .= abs.(ldl.D)
-
-        function LinearOperator(y, r)
-            y .= ldl \ r
-        end
-
-        num_multiplications = 2 * nnz(ldl.L) + n
-
-        println(
-            "Created ILUK AbsPD Preconditioner for $(input.name) with k=$k. Total FLOPs: $total_flops, Final shift: $(ldl.shift)",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(total_flops),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating ILUK AbsPD Preconditioner for $(input.name) with k=$k.",
-        )
-        rethrow(e)
-    end
-end
-
-
-function RandomizedNystrom(
-    input::problem_interface,
-    rank::Integer,
-    truncation::Integer,
-    μ::Real,
-    seed::Int = 123456789,
-)
-
-    @assert truncation ≤ rank "Truncation must be less than or equal to rank"
-
-    return RandomizedNystrom(input.Scaled, rank, truncation, μ, seed)
-
-end
-
-function RandomizedNystrom(
-    input::package,
-    rank::Integer,
-    truncation::Integer,
-    μ::Real,
-    seed::Int = 123456789,
-)
-
-    @assert truncation ≤ rank "Truncation must be less than or equal to rank"
-
-    try
-
-        Random.seed!(seed)
-
-        rny = RandomizedPreconditioners.NystromSketch(input.A, truncation, rank)
-
-        rnyinv = RandomizedPreconditioners.NystromPreconditionerInverse(rny, μ)
-
-        function LinearOperator(y, r)
-            mul!(y, rnyinv, r)
-        end
-
-        n = size(input.A, 1)
-
-        num_multiplications = 2 * n * truncation + truncation
-
-        generation_cost =
-            nnz(input.A) * rank +
-            3 * n * rank^2 +
-            (rank^3 - 3) / 6 +
-            (n + 1) * rank * (rank - 1) / 2
-
-        println(
-            "Created Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, seeded with $seed.",
-        )
-
-        return Preconditioner(
-            LinearOperator,
-            num_multiplications,
-            Float64(generation_cost),
-            input,
-        )
-
-    catch e
-        println(
-            "Error creating Randomized Nystrom Preconditioner for $(input.name) with rank $rank and truncation $truncation, seeded with $seed.",
-        )
-        rethrow(e)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        ldiv!(z, ldl, r)
+        return apply_fma
     end
 
+    nnz_L = length(ldl.Lnzvals)
+    nnz_lower_A = (nnz(A) - n) ÷ 2
+
+    prec = Preconditioner(apply!, generation_fma, generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => generation_fma,
+        "generation_graph" => generation_graph,
+        "num_retries" => ldl.num_retries,
+        "alpha_final" => ldl.α_out,
+        "fill_ratio" => nnz_L / nnz_lower_A,
+        "config" => Dict{String,Any}(
+            "memory_factor" => memory_factor,
+            "droptol" => droptol,
+            "max_retries" => max_retries,
+        ),
+    )
+    return prec, meta
 end
 
-
 """
-    getLapChol(a::SparseMatrixCSC; split=0, merge=0, fixedOrder=false)
+    LimitedLDLAbsPD(A::SparseMatrixCSC; memory_factor::Integer, droptol::Real,
+                    max_retries::Int=20) -> (Preconditioner, Dict)
 
-Computes an approximate Cholesky factorization for a Laplacian matrix, handling multiple connected components.
+Limited-memory LDLᵀ preconditioner with positive definiteness enforced by
+taking the absolute value of diagonal entries D after factorization.
+
+Uses standard (potentially indefinite) LDLᵀ factorization. If factorization
+fails due to a zero pivot, retries with diagonal shift escalation (α *= 10
+each time). After successful factorization, applies |D| to guarantee positive
+definiteness.
 
 # Arguments
-- `a::SparseMatrixCSC`: The input Laplacian matrix.
-- `split::Integer` (optional, default `0`): The number of levels for recursive splitting in the approximation.
-- `merge::Integer` (optional, default `0`): The number of levels for merging in the approximation.
-- `fixedOrder::Bool` (optional, default `false`): If `true`, enforces a fixed ordering for the factorization.
+- `memory_factor::Integer`: fill factor multiplier (target nnz per column = memory_factor × avg degree)
+- `droptol::Real`: drop tolerance for incomplete factorization
+- `max_retries::Int = 20`: maximum shift-increase attempts before giving up
 
 # Returns
-- `Tuple{Int, Vector{Vector{Int}}, Vector{Function}, Vector{Int}}`:
-    - `length(solvers)`: The number of solver instances created.
-    - `comps`: A list of connected components in the Laplacian.
-    - `solvers`: A list of solver functions, one for each component.
-    - `num_mult_list`: A list containing the estimated number of multiplications required for each solver.
-
-# Notes
-- If the matrix has multiple connected components, each component is factored separately.
-- Small components (size < 50) are solved directly using a dense Cholesky factorization.
-- Larger components use an approximate Cholesky factorization from `Laplacians.jl`, which supports recursive splitting and merging.
-- The function first identifies connected components using `Laplacians.components(a)`.
-- For single-component cases, the entire matrix is factored as one system.
-- If `fixedOrder` is `true`, a fixed ordering strategy is used for `Laplacians.LLMatOrd`.
+- `Preconditioner`: the preconditioner
+- `Dict`: diagnostics with keys `"num_retries"`, `"α_final"`, `"factorized"`, `"method"`, `"neg_diag_count"`
 """
-function getLapChol(a::SparseMatrixCSC; split = 0, merge = 0, fixedOrder = false)
+function LimitedLDLAbsPD(A::SparseMatrixCSC;
+                         memory_factor::Integer, droptol::Real,
+                         max_retries::Int = 20)
+    n = size(A, 1)
+    nzpercol = ((nnz(A) - n) / 2) / n
+    memory_val = ceil(Int, nzpercol * memory_factor)
+    P = collect(1:n)
 
-    # This function is derived from Laplacians.jl:
-    # Copyright (c) 2015-2016 Daniel A. Spielman and other contributors.
-    # Licensed under the MIT "Expat" License.
+    ldl = LLDL.lldl(A; P = P, memory = memory_val, droptol = droptol,
+                     α = 0.0, max_increase_α = max_retries)
 
-    # Permission is hereby granted, free of charge, to any person obtaining
-    # a copy of this software and associated documentation files (the
-    # "Software"), to deal in the Software without restriction, including
-    # without limitation the rights to use, copy, modify, merge, publish,
-    # distribute, sublicense, and/or sell copies of the Software, and to
-    # permit persons to whom the Software is furnished to do so, subject to
-    # the following conditions:
+    LLDL.factorized(ldl) || error("LimitedLDLAbsPD failed after $(ldl.num_retries) retries, α=$(ldl.α_out)")
 
-    # The above copyright notice and this permission notice shall be
-    # included in all copies or substantial portions of the Software.
+    # Count negative diagonals before taking absolute value
+    neg_diag_count = count(x -> x < 0, ldl.D)
+    ldl.D .= abs.(ldl.D)
 
-    # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-    # EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-    # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-    # IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-    # CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-    # TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-    # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+    apply_fma = UInt64(ldl.solve_flops)
+    generation_fma = UInt64(ldl.flops)
+    generation_graph = UInt64(ldl.graph_ops)
 
-    local comps = Array{Array{Int,1}}(undef, 0)
-    local solvers = Array{Function}(undef, 0)
-    local num_mult_list = Array{Int,1}(undef, 0)
-    local generation_flops_list = Array{Int,1}(undef, 0)
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        ldiv!(z, ldl, r)
+        return apply_fma
+    end
 
-    co = Laplacians.components(a)
+    nnz_L = length(ldl.Lnzvals)
+    nnz_lower_A = (nnz(A) - n) ÷ 2
 
-    if maximum(co) > 1
+    prec = Preconditioner(apply!, generation_fma, generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => generation_fma,
+        "generation_graph" => generation_graph,
+        "num_retries" => ldl.num_retries,
+        "alpha_final" => ldl.α_out,
+        "fill_ratio" => nnz_L / nnz_lower_A,
+        "neg_diag_count" => neg_diag_count,
+        "config" => Dict{String,Any}(
+            "memory_factor" => memory_factor,
+            "droptol" => droptol,
+            "max_retries" => max_retries,
+        ),
+    )
+    return prec, meta
+end
 
-        comps = Laplacians.vecToComps(co)
-        comps = Laplacians.vecToComps(co)
-        nullComps = findall(x -> length(x) == 1, comps)
-        hasNullComps = length(nullComps) > 0
-        start = 1
-        if hasNullComps
+# ═══════════════════════════════════════════════════════════════════════════════
+# ILU(k) LDLᵀ Preconditioners
+# ═══════════════════════════════════════════════════════════════════════════════
 
-            start = 2
-            flatNullComps = vcat(comps[nullComps]...)
-            comps = vcat([flatNullComps], comps[setdiff(1:end, nullComps)])
-            push!(solvers, Laplacians.nullSolver)
-            push!(generation_flops_list, 0)
+"""
+    ILUKShiftPD(A::SparseMatrixCSC; ilu_level::Integer,
+                max_retries::Int=20) -> (Preconditioner, Dict)
 
+Incomplete LDLᵀ preconditioner with level-of-fill `k` and positive definiteness
+enforced via diagonal shifting. Uses the vendored ILUK fork with flop and
+graph-op tracking.
+
+When a pivot becomes non-positive during factorization, the library adds a
+shift α to the diagonal and retries (α *= 10 each time, starting from
+√ε ≈ 1.5e-8). Up to `max_retries` attempts are made internally.
+
+# Arguments
+- `ilu_level::Integer`: level of fill (ilu_level ≥ 0)
+- `max_retries::Int = 20`: maximum shift-increase attempts before giving up
+
+# Returns
+- `Preconditioner`: the preconditioner
+- `Dict`: diagnostics with keys `"num_retries"`, `"α_final"`, `"fill_ratio"`
+"""
+function ILUKShiftPD(A::SparseMatrixCSC;
+                     ilu_level::Integer,
+                     max_retries::Int = 20)
+    n = size(A, 1)
+
+    ldl = ILUK.ldlt_k(A, ilu_level;
+                       α = 0.0,
+                       ensure_positive = true,
+                       max_attempts = max_retries)
+
+    ldl.success || error("ILUKShiftPD failed after $(ldl.num_retries) retries, α=$(ldl.shift)")
+
+    apply_fma = UInt64(ldl.solve_flops)
+    generation_fma = UInt64(ldl.flops)
+    generation_graph = UInt64(ldl.graph_ops)
+
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        ILUK.ldl_solve!(z, ldl.L, ldl.D, r)
+        return apply_fma
+    end
+
+    nnz_lower_A = (nnz(A) - n) ÷ 2
+
+    prec = Preconditioner(apply!, generation_fma, generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => generation_fma,
+        "generation_graph" => generation_graph,
+        "num_retries" => ldl.num_retries,
+        "alpha_final" => ldl.shift,
+        "fill_ratio" => nnz(ldl.L) / nnz_lower_A,
+        "config" => Dict{String,Any}(
+            "ilu_level" => ilu_level,
+            "max_retries" => max_retries,
+        ),
+    )
+    return prec, meta
+end
+
+"""
+    ILUKAbsPD(A::SparseMatrixCSC; ilu_level::Integer,
+              max_retries::Int=20) -> (Preconditioner, Dict)
+
+Incomplete LDLᵀ preconditioner with level-of-fill `k` and positive definiteness
+enforced by taking the absolute value of diagonal entries D after factorization.
+
+Uses standard (potentially indefinite) LDLᵀ factorization. If factorization
+fails due to a zero pivot, retries with diagonal shift escalation (α *= 10
+each time). After successful factorization, applies |D| to guarantee positive
+definiteness.
+
+# Arguments
+- `ilu_level::Integer`: level of fill (ilu_level ≥ 0)
+- `max_retries::Int = 20`: maximum shift-increase attempts before giving up
+
+# Returns
+- `Preconditioner`: the preconditioner
+- `Dict`: diagnostics with keys `"num_retries"`, `"α_final"`, `"fill_ratio"`, `"neg_diag_count"`
+"""
+function ILUKAbsPD(A::SparseMatrixCSC;
+                   ilu_level::Integer,
+                   max_retries::Int = 20)
+    n = size(A, 1)
+
+    ldl = ILUK.ldlt_k(A, ilu_level;
+                       α = 0.0,
+                       ensure_positive = false,
+                       max_attempts = max_retries)
+
+    ldl.success || error("ILUKAbsPD failed after $(ldl.num_retries) retries, α=$(ldl.shift)")
+
+    neg_diag_count = count(x -> x < 0, ldl.D)
+    ldl.D .= abs.(ldl.D)
+
+    apply_fma = UInt64(ldl.solve_flops)
+    generation_fma = UInt64(ldl.flops)
+    generation_graph = UInt64(ldl.graph_ops)
+
+    function apply!(z::Vector{Float64}, r::Vector{Float64})::Float64
+        ILUK.ldl_solve!(z, ldl.L, ldl.D, r)
+        return apply_fma
+    end
+
+    nnz_lower_A = (nnz(A) - n) ÷ 2
+
+    prec = Preconditioner(apply!, generation_fma, generation_graph)
+    meta = Dict{String,Any}(
+        "success" => true,
+        "apply_fma" => apply_fma,
+        "apply_cost_kind" => "fixed",
+        "generation_fma" => generation_fma,
+        "generation_graph" => generation_graph,
+        "num_retries" => ldl.num_retries,
+        "alpha_final" => ldl.shift,
+        "fill_ratio" => nnz(ldl.L) / nnz_lower_A,
+        "neg_diag_count" => neg_diag_count,
+        "config" => Dict{String,Any}(
+            "ilu_level" => ilu_level,
+            "max_retries" => max_retries,
+        ),
+    )
+    return prec, meta
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PyAMG Preconditioners
+#
+# Four solver types, each with explicit keyword arguments and Julia-side
+# validation. All use the vendored pyamg fork with setup_complexity() for
+# work tracking and _MultilevelSolver__solve for zero-allocation apply.
+#
+# Valid configurations per solver type:
+#
+# ── PyAMGRuStu (Classical / Ruge-Stuben AMG) ──
+#   cycle:         :V, :W, :F, :AMLI
+#   num_cycles:    1, 2, ...
+#   coarse_solver: :pinv, :lu, :cholesky, :splu, :cg
+#   strength:      :symmetric, :classical, :evolution, :distance,
+#                  :algebraic_distance, :affinity, :energy_based, nothing
+#                  Sub-options: (theta=0.25,), (epsilon=4.0,), (k=2,), etc.
+#   CF:            :RS, :PMIS, :PMISc, :CLJP, :CLJPc, :CR
+#                  Sub-options: (second_pass=false,), etc.
+#   interpolation: :direct, :classical
+#   presmoother:   see PYAMG_SMOOTHER_METHODS below
+#   postsmoother:  see PYAMG_SMOOTHER_METHODS below
+#   max_levels:    default 30
+#   max_coarse:    default 10
+#
+# ── PyAMGSmAgg (Smoothed Aggregation AMG) ──
+#   cycle, num_cycles, strength, presmoother, postsmoother: same as RuStu
+#   aggregate:     :standard, :lloyd, :balanced_lloyd, :naive, :pairwise, :metis
+#   smooth:        :jacobi, :richardson, :energy, nothing
+#                  Sub-options: (omega=4/3,), (filter=true,), (krylov=:gmres,)
+#   improve_candidates: smoother spec or nothing
+#   diagonal_dominance: true/false
+#   max_levels:    default 10
+#   max_coarse:    default 10
+#
+# ── PyAMGRootnode (Root-node SA AMG) ──
+#   Same as SmAgg except smooth only supports :energy and nothing
+#
+# ── PyAMGPairwise (Pairwise Aggregation AMG) ──
+#   cycle, num_cycles, presmoother, postsmoother: same as RuStu
+#   theta:         0.0-1.0 (strength threshold)
+#   norm:          :min, :abs
+#   matchings:     1, 2, 3, ... (pairwise matchings per level)
+#   max_levels:    default 20
+#   max_coarse:    default 10
+#
+# ── Smoother methods (pre/post) ──
+#   :gauss_seidel, :block_gauss_seidel, :jacobi, :block_jacobi,
+#   :cf_jacobi, :fc_jacobi, :cf_block_jacobi, :fc_block_jacobi,
+#   :richardson, :sor, :chebyshev, :gauss_seidel_nr, :gauss_seidel_ne,
+#   :jacobi_ne, :cg, :gmres, :cgne, :cgnr, :schwarz,
+#   :strength_based_schwarz, nothing
+#   Sub-options: (sweep=:forward,), (sweep=:backward,), (sweep=:symmetric,),
+#                (iterations=2,), (omega=0.8,), (withrho=true,), (maxiter=5,)
+#   Per-level: pass a Vector of specs, e.g.
+#     [:gauss_seidel, (:jacobi, (omega=0.8,))]
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Valid option sets for validation ──────────────────────────────────────────
+
+const PYAMG_CYCLES = (:V, :W, :F, :AMLI, :K)
+
+# Coarse solvers with proper work instrumentation.
+# Dense direct: pinv (SVD), lu, cholesky — setup O(n³), apply O(n²)
+# Sparse direct: splu — setup O(nnz), apply O(nnz)
+# Krylov: cg — no setup cost, apply O(nnz) per iteration (10 default)
+#
+# NOTE: Relaxation-based coarse solvers (gauss_seidel, jacobi, etc.) are NOT
+# included because PyAMG rebuilds the smoother setup on every coarse solve call
+# (creates a fresh Level object each time), making them both slow and poorly
+# instrumented. GMRES is excluded because our problems are symmetric.
+const PYAMG_COARSE_SOLVERS = (:pinv, :lu, :cholesky, :splu, :cg)
+
+const PYAMG_STRENGTH_METHODS = (
+    :symmetric, :classical, :evolution, :distance,
+    :algebraic_distance, :affinity, :energy_based, nothing,
+)
+
+const PYAMG_CF_METHODS = (:RS, :PMIS, :PMISc, :CLJP, :CLJPc, :CR)
+
+const PYAMG_INTERPOLATION_METHODS = (:direct, :classical)
+
+# Note: :balanced_lloyd can fail with "maxsize too small" on graphs with highly
+# uneven degree distribution (e.g., power grids with hub nodes). The balanced Lloyd
+# clustering algorithm allocates work arrays sized at 12× the average cluster size;
+# clusters that grow beyond this limit (due to uneven connectivity) trigger the error.
+# This is a limitation of the algorithm, not a bug — it works on more regular graphs.
+#
+# Note: balanced_lloyd_aggregation (in PyAMG's aggregate.py) constructs its AggOp via
+# COO→CSR with numpy int64 row/col arrays, producing int64 indices. The downstream
+# amg_core.fit_candidates pybind11 binding only accepts int32 index arrays. We patch
+# fit_candidates (in tentative.py) to cast indices to int32 before calling the C extension.
+const PYAMG_AGGREGATE_METHODS = (:standard, :lloyd, :balanced_lloyd, :naive, :pairwise, :metis)
+
+# PyAMG uses spaces not underscores in aggregate method names
+const _AGGREGATE_PY_NAMES = Dict{Symbol,String}(
+    :balanced_lloyd => "balanced lloyd",
+)
+_aggregate_to_py(s::Symbol) = PythonCall.pystr(get(_AGGREGATE_PY_NAMES, s, String(s)))
+_aggregate_to_py(x) = _option_to_py(x)  # tuples and other forms pass through
+
+const PYAMG_SA_SMOOTH_METHODS = (:jacobi, :richardson, :energy, nothing)
+
+const PYAMG_ROOTNODE_SMOOTH_METHODS = (:energy, nothing)
+
+const PYAMG_SMOOTHER_METHODS = (
+    :gauss_seidel, :block_gauss_seidel, :jacobi, :block_jacobi,
+    :cf_jacobi, :fc_jacobi, :cf_block_jacobi, :fc_block_jacobi,
+    :richardson, :sor, :chebyshev,
+    :gauss_seidel_nr, :gauss_seidel_ne, :jacobi_ne,
+    :cg, :gmres, :cgne, :cgnr,
+    :schwarz, :strength_based_schwarz, nothing,
+)
+
+# ── Conversion helpers: Julia symbols/named tuples → Python tuples/dicts ─────
+
+"""Convert a Symbol to a Python string, or pass through nothing as Python None."""
+function _to_py(s::Symbol)
+    return PythonCall.pystr(String(s))
+end
+function _to_py(::Nothing)
+    return PythonCall.Py(nothing)
+end
+
+"""
+Convert a smoother/option specification from Julia to Python format.
+
+Accepted forms:
+- `nothing` → Python None
+- `:method` → Python string `"method"`
+- `(:method, (key=val, ...))` → Python tuple `("method", {"key": val, ...})`
+"""
+function _option_to_py(opt::Nothing)
+    return PythonCall.Py(nothing)
+end
+function _option_to_py(opt::Symbol)
+    return _to_py(opt)
+end
+function _option_to_py(opt::Tuple{Symbol, NamedTuple})
+    method, kwargs = opt
+    d = PythonCall.pydict()
+    for (k, v) in pairs(kwargs)
+        d[PythonCall.pystr(String(k))] = v isa Symbol ? _to_py(v) : PythonCall.Py(v)
+    end
+    return PythonCall.pytuple((PythonCall.pystr(String(method)), d))
+end
+
+"""
+Convert a per-level list of smoother specifications to Python.
+Accepts a single spec or a Vector of specs (for per-level control).
+"""
+function _option_to_py(opt::Vector)
+    return PythonCall.pylist([_option_to_py(o) for o in opt])
+end
+
+# ── Smoother validation ──────────────────────────────────────────────────────
+
+function _validate_smoother(name::String, spec)
+    if spec === nothing
+        return
+    elseif spec isa Symbol
+        spec in PYAMG_SMOOTHER_METHODS || error("Invalid $name method: $spec. Valid: $PYAMG_SMOOTHER_METHODS")
+    elseif spec isa Tuple{Symbol, NamedTuple}
+        spec[1] in PYAMG_SMOOTHER_METHODS || error("Invalid $name method: $(spec[1]). Valid: $PYAMG_SMOOTHER_METHODS")
+    elseif spec isa Vector
+        for s in spec
+            _validate_smoother(name, s)
         end
-
-        for i = start:length(comps)
-
-            ind = comps[i]
-            asub = a[ind, ind]
-
-            if length(ind) < 50
-
-                la_forced = Laplacians.forceLap(asub)
-                N = size(la_forced)[1]
-
-                ind_local = findmax(diag(la_forced))[2]
-                leave = [1:(ind_local-1); (ind_local+1):N]
-
-                la_forced_sub = la_forced[leave, leave]
-
-                ldli = cholesky(la_forced_sub)
-
-                L_sparse = sparse(ldli.L)
-                push!(num_mult_list, 2 * nnz(L_sparse))
-                # Generation FLOPs: Σⱼ nnz(Lⱼ)² for exact Cholesky
-                gen_flops = sum((L_sparse.colptr[j+1] - L_sparse.colptr[j])^2 for j in 1:size(L_sparse, 2))
-                push!(generation_flops_list, gen_flops)
-
-                F(b) = begin
-                    bs = b[leave] .- mean(b)
-
-
-                    xs = ldli \ bs
-
-                    x = zeros(size(b))
-                    x[leave] = xs
-                    return x
-
-                end
-
-                push!(solvers, F)
-
-            else
-
-                local ldli, llmat
-
-                if split >= 1 && merge < 1
-                    llmat = Laplacians.LLmatp(asub, split)
-                    ldli = Laplacians.approxChol(llmat, split, merge)
-                elseif split >= 1 && merge >= 1
-                    llmat = Laplacians.LLmatp(asub, split)
-                    ldli = Laplacians.approxChol(llmat, split, merge)
-                else
-                    llmat = Laplacians.LLmatp(asub)
-                    ldli = Laplacians.approxChol(llmat)
-                end
-
-                push!(num_mult_list, 2 * length(ldli.fval) + size(ldli.d, 1))
-                # Generation FLOPs: 7 ops per entry for approxChol
-                push!(generation_flops_list, 7 * length(ldli.fval))
-
-                push!(solvers, b -> Laplacians.LDLsolver(ldli, b))
-
-            end
-
-        end
-
     else
+        error("Invalid $name format. Use :method, (:method, (key=val,)), or a Vector of these.")
+    end
+end
 
-        local ldli = nothing
+# ── Strength/aggregate/smooth validation helpers ─────────────────────────────
 
-        if fixedOrder
-            if split >= 1 && merge == split
-                llmat = Laplacians.LLMatOrd(a, split)
-                ldli = Laplacians.approxChol(llmat, split, MergeSort)
-            elseif split >= 1 && merge != split
-                println(
-                    "Fixed-order solve with merge != split not implemented here. Abort.",
-                )
-                return 0, 0, true # bool error
-            else
-                llmat = Laplacians.LLMatOrd(a)
-                ldli = Laplacians.approxChol(llmat)
+function _validate_option(name::String, spec, valid_set)
+    if spec === nothing
+        nothing in valid_set || error("$name does not accept nothing.")
+        return
+    elseif spec isa Symbol
+        spec in valid_set || error("Invalid $name: $spec. Valid: $valid_set")
+    elseif spec isa Tuple{Symbol, NamedTuple}
+        spec[1] in valid_set || error("Invalid $name: $(spec[1]). Valid: $valid_set")
+    elseif spec isa Vector
+        for s in spec
+            _validate_option(name, s, valid_set)
+        end
+    else
+        error("Invalid $name format. Use :method, (:method, (key=val,)), or a Vector of these.")
+    end
+end
+
+# ── Common option parser ─────────────────────────────────────────────────────
+
+"""
+    _parse_common_pyamg_opts(; cycle, num_cycles, presmoother, postsmoother,
+                              max_levels, max_coarse) -> (Dict, Symbol, Int)
+
+Validates and converts the options shared by all four PyAMG solver types.
+Returns `(kwargs_dict, cycle, num_cycles)`.
+"""
+function _parse_setup_pyamg_opts(;
+    coarse_solver::Symbol,
+    presmoother,
+    postsmoother,
+    max_levels::Int,
+    max_coarse::Int,
+)
+    coarse_solver in PYAMG_COARSE_SOLVERS || error("Invalid coarse_solver: $coarse_solver. Valid: $PYAMG_COARSE_SOLVERS")
+    max_levels >= 1 || error("max_levels must be >= 1, got $max_levels")
+    max_coarse >= 1 || error("max_coarse must be >= 1, got $max_coarse")
+    _validate_smoother("presmoother", presmoother)
+    _validate_smoother("postsmoother", postsmoother)
+
+    kwargs = Dict{Symbol, Any}(
+        :presmoother => _option_to_py(presmoother),
+        :postsmoother => _option_to_py(postsmoother),
+        :coarse_solver => _to_py(coarse_solver),
+        :max_levels => max_levels,
+        :max_coarse => max_coarse,
+    )
+
+    return kwargs
+end
+
+function _parse_common_pyamg_opts(;
+    cycle::Symbol,
+    num_cycles::Int,
+    coarse_solver::Symbol,
+    presmoother,
+    postsmoother,
+    max_levels::Int,
+    max_coarse::Int,
+)
+    cycle in PYAMG_CYCLES || error("Invalid cycle: $cycle. Valid: $PYAMG_CYCLES")
+    num_cycles >= 1 || error("num_cycles must be >= 1, got $num_cycles")
+    coarse_solver in PYAMG_COARSE_SOLVERS || error("Invalid coarse_solver: $coarse_solver. Valid: $PYAMG_COARSE_SOLVERS")
+    max_levels >= 1 || error("max_levels must be >= 1, got $max_levels")
+    max_coarse >= 1 || error("max_coarse must be >= 1, got $max_coarse")
+    _validate_smoother("presmoother", presmoother)
+    _validate_smoother("postsmoother", postsmoother)
+
+    kwargs = Dict{Symbol, Any}(
+        :presmoother => _option_to_py(presmoother),
+        :postsmoother => _option_to_py(postsmoother),
+        :coarse_solver => _to_py(coarse_solver),
+        :max_levels => max_levels,
+        :max_coarse => max_coarse,
+    )
+
+    return kwargs
+end
+
+# ── Shared PyAMG builder ─────────────────────────────────────────────────────
+
+"""
+    _build_pyamg_hierarchy(A, solver_fn_name, solver_kwargs) -> OptionedPreconditioner
+
+Builds the multigrid hierarchy once and returns an `OptionedPreconditioner` whose
+callable creates a `Preconditioner` for any combination of apply-time parameters
+(cycle type, num_cycles, smoothers, coarse_solver, K-cycle settings).
+
+The hierarchy, buffers, and setup-time costs are captured in the closure.
+Call `op(; kwargs...)` to get a `(Preconditioner, meta)` pair.
+
+Note: smoother and coarse_solver swaps mutate the shared hierarchy in place.
+Only one `Preconditioner` from a given hierarchy should be in use at a time.
+Omitted options restore the hierarchy's original defaults. Generation costs
+include shared hierarchy work plus only the active configuration's setup,
+regardless of whether another configuration has already cached that work.
+"""
+function _build_pyamg_hierarchy(A::SparseMatrixCSC, solver_fn_name::Symbol, solver_kwargs::Dict)
+    _sleep_julia_workers!()
+    n = size(A, 1)
+    sp = PythonCall.pyimport("scipy.sparse")
+    pyamg = PythonCall.pyimport("pyamg")
+    np = PythonCall.pyimport("numpy")
+    smoothing = PythonCall.pyimport("pyamg.relaxation.smoothing")
+
+    # Convert Julia CSC to SciPy CSR (0-indexed; SciPy auto-converts indices to int32)
+    A_csr = sp.csr_matrix(
+        PythonCall.pytuple((PythonCall.Py(A.nzval), PythonCall.Py(A.rowval .- 1), PythonCall.Py(A.colptr .- 1))),
+        shape=PythonCall.pytuple((n, n)),
+    )
+
+    # Build multigrid hierarchy
+    solver_fn = PythonCall.pygetattr(pyamg, String(solver_fn_name))
+    ml = solver_fn(A_csr; solver_kwargs...)
+
+    nnz_finest = PythonCall.pyconvert(Int64, ml.levels[0].A.nnz)
+    default_pre = get(solver_kwargs, :presmoother, get(solver_kwargs, :prepostsmoother, PythonCall.Py(nothing)))
+    default_post = get(solver_kwargs, :postsmoother, get(solver_kwargs, :prepostsmoother, PythonCall.Py(nothing)))
+    default_coarse = ml.coarse_solver
+    coarse_solvers = Dict{Symbol,PythonCall.Py}()
+
+    # Level info (fixed per hierarchy)
+    num_levels = PythonCall.pyconvert(Int64, PythonCall.pylen(ml.levels))
+    coarse_n = PythonCall.pyconvert(Int64, ml.levels[num_levels - 1].A.shape[0])
+
+    # Pre-allocate Julia buffers and create numpy views (zero-copy)
+    z_buf = zeros(Float64, n)
+    r_buf = zeros(Float64, n)
+    z_np = np.asarray(z_buf)
+    r_np = np.asarray(r_buf)
+
+    function configure(;
+            cycle::Symbol=:V, num_cycles::Int=1,
+            k_cg_iters::Int=1, k_early_exit::Real=0.0,
+            presmoother=nothing, postsmoother=nothing,
+            coarse_solver=nothing)
+
+        _sleep_julia_workers!()
+        cycle in PYAMG_CYCLES || error("Invalid cycle: $cycle")
+        num_cycles >= 1 || error("num_cycles must be positive")
+        cycle == :K && k_cg_iters < 1 && error("k_cg_iters must be positive")
+        isfinite(k_early_exit) && k_early_exit >= 0 ||
+            throw(ArgumentError("k_early_exit must be finite and nonnegative"))
+        _validate_smoother("presmoother", presmoother)
+        _validate_smoother("postsmoother", postsmoother)
+        # Resolve defaults independently of whichever configuration ran last.
+        pre_py = presmoother === nothing ? default_pre : _option_to_py(presmoother)
+        post_py = postsmoother === nothing ? default_post : _option_to_py(postsmoother)
+        smoothing.change_smoothers(ml, presmoother=pre_py, postsmoother=post_py)
+
+        # Swap coarse solver if requested
+        if coarse_solver !== nothing
+            coarse_solver in PYAMG_COARSE_SOLVERS || error("Invalid coarse_solver: $coarse_solver")
+            pyamg_util = PythonCall.pyimport("pyamg.multilevel")
+            ml.coarse_solver = get!(coarse_solvers, coarse_solver) do
+                pyamg_util.coarse_grid_solver(PythonCall.pystr(String(coarse_solver)))
             end
         else
-            if split >= 1 && merge < 1
-                llmat = Laplacians.LLmatp(a, split)
-                ldli = Laplacians.approxChol(llmat, split, merge)
-            elseif split >= 1 && merge >= 1
-                llmat = Laplacians.LLmatp(a, split)
-                ldli = Laplacians.approxChol(llmat, split, merge)
-            else
-                llmat = Laplacians.LLmatp(a)
-                ldli = Laplacians.approxChol(llmat)
-            end
+            ml.coarse_solver = default_coarse
         end
 
-        subSolver(b) = Laplacians.LDLsolver(ldli, b)
+        parts = ml.setup_work_breakdown()
+        generation_breakdown = Dict{String,Any}()
+        gen_fma = UInt64(0)
+        gen_graph = UInt64(0)
+        for name in ("hierarchy", "smoother", "coarse")
+            part = parts[name]
+            fma = UInt64(round(PythonCall.pyconvert(Float64, part[0])))
+            graph = UInt64(round(PythonCall.pyconvert(Float64, part[1])))
+            generation_breakdown[name] = Dict("fma" => fma, "graph" => graph)
+            gen_fma += fma
+            gen_graph += graph
+        end
 
-        push!(num_mult_list, 2 * length(ldli.fval) + size(ldli.d, 1))
-        # Generation FLOPs: 7 ops per entry for approxChol
-        push!(generation_flops_list, 7 * length(ldli.fval))
+        # Set K-cycle parameters on the solver object
+        if cycle == :K
+            ml._k_cg_iters = k_cg_iters
+            ml._k_early_exit = k_early_exit
+        end
 
-        push!(solvers, subSolver)
-    end
-    return length(solvers), comps, solvers, num_mult_list, generation_flops_list
-end
+        # Compute cycle complexity (reads smoothers dynamically)
+        cycle_str = String(cycle)
+        py_cycle = PythonCall.pystr(cycle_str)
+        cycle_cc = PythonCall.pyconvert(Float64, ml.cycle_complexity(cycle=cycle_str))
+        apply_fma_per_cycle = cycle_cc * nnz_finest
+        apply_fma = UInt64(round(apply_fma_per_cycle * num_cycles))
 
+        # Build config from setup kwargs + apply kwargs
+        config = Dict{String,Any}(String(k) => v for (k, v) in solver_kwargs)
+        config["cycle"] = String(cycle)
+        config["num_cycles"] = num_cycles
+        config["k_cg_iters"] = k_cg_iters
+        config["k_early_exit"] = k_early_exit
+        if presmoother !== nothing
+            config["presmoother"] = presmoother
+        end
+        if postsmoother !== nothing
+            config["postsmoother"] = postsmoother
+        end
+        if coarse_solver !== nothing
+            config["coarse_solver"] = String(coarse_solver)
+        end
 
-function LaplaceStripped(mat::problem_interface, split::Integer, merge::Integer)
-    mat.type == :symmetric_graph && return LaplaceStripped(mat.Original, split, merge) # run on the Laplacian if undirected graph
-    mat.Scaled.diagonally_dominant &&
-        return LaplaceStripped(mat.Scaled, split, merge, mat.Scaled) # run augmented on scaled if SDD
-    mat.Original.diagonally_dominant &&
-        return LaplaceStripped(mat.Original, split, merge, mat.Original) # run augmented on original if SDD
-    return LaplaceStripped(mat.Special, split, merge, mat.Scaled) # run augmented on padded, apply to scaled
-end
+        meta = Dict{String,Any}(
+            "success" => true,
+            "apply_fma" => apply_fma,
+            # K's full traversal is used for screening only with ratio early
+            # exit disabled. Exact-zero branches can still cost less.
+            "apply_cost_kind" => cycle == :K ?
+                (k_early_exit == 0 ? "fixed_inner_iterations" : "variable") : "fixed",
+            "generation_fma" => gen_fma,
+            "generation_graph" => gen_graph,
+            "generation_cost_breakdown" => generation_breakdown,
+            "generation_cost_model" => "configuration_setup_v1",
+            "num_levels" => num_levels,
+            "coarse_n" => coarse_n,
+            "cycle_complexity" => cycle_cc,
+            "config" => config,
+        )
 
-function LaplaceStripped(input::package, split::Integer, merge::Integer)
-
-    a = laplace_to_adj(input.A)
-
-    len, components, solvers, num_mult_list, _ = getLapChol(a; split = split, merge = merge)
-
-    solver = solvers[1]
-
-    function LinearOperator(y, r)
-        y .= solver(r)
-    end
-
-    return Preconditioner(LinearOperator, num_mult_list[1], Inf, input)
-
-end
-
-
-function LaplaceStripped(input::package, split::Integer, merge::Integer, run_on::package)
-
-    A_aug_lap, _ = make_augmented(input.A, input.b)
-
-    local sz = size(input.A, 1)
-    local sol_ = zeros(size(A_aug_lap, 1))
-    local rhs = zeros(size(A_aug_lap, 1))
-
-    a = laplace_to_adj(A_aug_lap)
-
-    len, components, solvers, num_mult_list, _ = getLapChol(a; split = split, merge = merge)
-
-    work_space = [zeros(length(component)) for component in components]
-
-    function LinearOperator(sol, r)
-
-        sol .= r
-
-        view(rhs, 1:sz) .= sol
-        view(rhs, sz+1:length(rhs)) .= .-sol
-
-        if len > 1
-            for i = 1:len
-                work_space[i] .= view(rhs, components[i])
-                sol_[components[i]] .= solvers[i](work_space[i])
+        if cycle == :K
+            function VariableLinearOperator(z::Vector{Float64}, r::Vector{Float64})::Float64
+                _sleep_julia_workers!()
+                r_buf .= r
+                z_buf .= 0.0
+                cost = 0.0
+                for _ in 1:num_cycles
+                    cost += PythonCall.pyconvert(Float64,
+                        ml._MultilevelSolver__solve(0, z_np, r_np, py_cycle))
+                end
+                z .= z_buf
+                return cost
             end
+            return Preconditioner(VariableLinearOperator, gen_fma, gen_graph), meta
         else
-            sol_ .= solvers[1](rhs)
-        end
-
-        sol .= (view(sol_, 1:sz) .- view(sol_, sz+1:length(sol_))) ./ 2
-
-    end
-
-    num_multiplications = sum(num_mult_list)
-
-    return Preconditioner(LinearOperator, num_multiplications, Inf, run_on)
-end
-
-
-# LaplaceStrippedFlops: Returns (Preconditioner, generation_flops) for FLOP tracking
-
-function LaplaceStrippedFlops(mat::problem_interface, split::Integer, merge::Integer)
-    mat.type == :symmetric_graph && return LaplaceStrippedFlops(mat.Original, split, merge)
-    mat.Scaled.diagonally_dominant &&
-        return LaplaceStrippedFlops(mat.Scaled, split, merge, mat.Scaled)
-    mat.Original.diagonally_dominant &&
-        return LaplaceStrippedFlops(mat.Original, split, merge, mat.Original)
-    return LaplaceStrippedFlops(mat.Special, split, merge, mat.Scaled)
-end
-
-function LaplaceStrippedFlops(input::package, split::Integer, merge::Integer)
-
-    a = laplace_to_adj(input.A)
-
-    len, components, solvers, num_mult_list, generation_flops_list = getLapChol(a; split = split, merge = merge)
-
-    solver = solvers[1]
-
-    function LinearOperator(y, r)
-        y .= solver(r)
-    end
-
-    generation_flops = sum(generation_flops_list)
-    return Preconditioner(LinearOperator, num_mult_list[1], Float64(generation_flops), input)
-
-end
-
-function LaplaceStrippedFlops(input::package, split::Integer, merge::Integer, run_on::package)
-
-    A_aug_lap, _ = make_augmented(input.A, input.b)
-
-    local sz = size(input.A, 1)
-    local sol_ = zeros(size(A_aug_lap, 1))
-    local rhs = zeros(size(A_aug_lap, 1))
-
-    a = laplace_to_adj(A_aug_lap)
-
-    len, components, solvers, num_mult_list, generation_flops_list = getLapChol(a; split = split, merge = merge)
-
-    work_space = [zeros(length(component)) for component in components]
-
-    function LinearOperator(sol, r)
-
-        sol .= r
-
-        view(rhs, 1:sz) .= sol
-        view(rhs, sz+1:length(rhs)) .= .-sol
-
-        if len > 1
-            for i = 1:len
-                work_space[i] .= view(rhs, components[i])
-                sol_[components[i]] .= solvers[i](work_space[i])
+            function LinearOperator(z::Vector{Float64}, r::Vector{Float64})::Float64
+                _sleep_julia_workers!()
+                r_buf .= r
+                z_buf .= 0.0
+                for _ in 1:num_cycles
+                    ml._MultilevelSolver__solve(0, z_np, r_np, py_cycle)
+                end
+                z .= z_buf
+                return apply_fma
             end
-        else
-            sol_ .= solvers[1](rhs)
+            return Preconditioner(LinearOperator, gen_fma, gen_graph), meta
         end
-
-        sol .= (view(sol_, 1:sz) .- view(sol_, sz+1:length(sol_))) ./ 2
-
     end
 
-    num_multiplications = sum(num_mult_list)
-    generation_flops = sum(generation_flops_list)
-
-    return Preconditioner(LinearOperator, num_multiplications, Float64(generation_flops), run_on)
+    return OptionedPreconditioner(configure)
 end
 
+"""
+    _build_pyamg(A, solver_fn_name, solver_kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
+        -> (Preconditioner, Dict)
 
-## Combinatorial Multigrid Derivative Code
-# This next block of code is a modification of CombinatorialMultigrid to output the work done by the preconditioner.
-# The package code must also be modified to output the H, M, W, X variables
-# in the CombinatorialMultigrid.cmg_preconditioner_lap function.
-
-# MIT License
-
-# Copyright (c) 2021 Bodhi
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-# struct Hierarchy
-#     A::SparseMatrixCSC{Float64, Int64}
-#     invD::Vector{Float64}
-#     cI::Vector{Int64}
-#     #chol::CholT
-#     chol::LDLFactorizations.LDLFactorization{Float64, Int64, Int64, Int64}
-# end
-
-# struct Workspace
-#     x::Vector{Float64}
-#     b::Vector{Float64}
-#     tmp::Vector{Float64}
-# end
-
-# mutable struct LevelAux
-#     fwd::Bool
-#     rc::Int32
-#     repeat::Int32
-#     #
-#     sd::Bool
-#     islast::Bool
-#     iterative::Bool
-#     n::Int64
-#     nc::Int64
-# end
-
-# function preconditioner_i(H, W, X, b::Vector{Float64})
-#     level = Int64(1)
-#     #@inbounds W[1].b = b
-#     # BLAS.blascopy!(length(b),b,1,W[1].b,1)
-
-#     num_mult = 0
-
-#     while level > 0
-#         x = W[level].x
-#         b = W[level].b
-#         tmp = W[level].tmp
-
-#         invD = H[level].invD
-#         A = H[level].A
-#         cI = H[level].cI
-
-#         if X[level].islast && !X[level].iterative
-#             # @inbounds ldiv!(x, H[level].chol,b)
-#             num_mult += 2 * length(H[level].chol.Li) + length(H[level].chol.d)
-#             level -= 1
-#         elseif X[level].islast && X[level].iterative
-#             num_mult += length(b)
-#             # W[level].x .= b .* invD
-#             level -= 1
-#         elseif !X[level].islast && X[level].fwd
-#             repeat = X[level].repeat   #number of 'recursive' calls
-
-#             if X[level].rc > repeat
-#                 X[level].rc = 1
-#                 level -= 1
-#             else
-#                 if X[level].rc == 1
-#                     # W[level].x .= b.* invD
-#                     num_mult += length(b)
-#                 else
-#                     mul!(tmp, A, x)
-#                     tmp .-= b
-#                     # tmp .*= -invD
-#                     num_mult += length(b)
-#                     W[level].x .+= tmp
-#                 end
-
-#                 mul!(tmp, A, x)
-#                 tmp .-= b
-#                 X[level].fwd = false
-#                 # interpolate!(W[level+1].b, cI, -tmp)
-#                 level += 1
-#             end
-#         elseif !X[level].islast && !X[level].fwd
-#             z = W[level+1].x
-#             W[level].x .+= z[cI]
-#             # mul!(tmp, A, x)
-#             num_mult += nnz(A)
-#             tmp .-= b
-#             tmp .*= -invD
-#             num_mult += length(b)
-#             W[level].x .+= tmp
-#             X[level].rc += 1
-#             X[level].fwd = true
-#         end
-#     end
-
-#     return num_mult
-# end
-
-## End Combinatorial Multigrid Derivative Code
-
-
-function CombinatorialMG(mat::problem_interface)
-    mat.type == :symmetric_graph && return CombinatorialMG(mat.Original) # run on the Laplacian if undirected graph
-    mat.Scaled.diagonally_dominant && return CombinatorialMG(mat.Scaled, mat.Scaled) # run on the scaled if SDD
-    mat.Original.diagonally_dominant && return CombinatorialMG(mat.Original, mat.Original) # run on the original if SDD
-    return CombinatorialMG(mat.Special, mat.Scaled) # run on the padded, apply to scaled
+Builds the hierarchy and immediately configures it with the given apply-time parameters.
+"""
+function _build_pyamg(A::SparseMatrixCSC, solver_fn_name::Symbol, solver_kwargs::Dict;
+                      cycle::Symbol=:V, num_cycles::Int=1,
+                      k_cg_iters::Int=1, k_early_exit::Real=0.0)
+    op = _build_pyamg_hierarchy(A, solver_fn_name, solver_kwargs)
+    return op(; cycle, num_cycles, k_cg_iters, k_early_exit)
 end
 
-function CombinatorialMG(mat::package)
-    try
-        work_lookup = CSV.read(joinpath(EXT, "CombinatorialWorkCost.csv"), DataFrame)
+# ── Ruge-Stuben ──────────────────────────────────────────────────────────────
 
-        idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
+"""
+    PyAMGRuStu(A; kwargs...) -> Preconditioner
 
-        if idx === nothing
-            throw(ArgumentError("Matrix not found in the lookup table."))
-        end
+Classical AMG (Ruge-Stuben) preconditioner via PyAMG.
+Returns `Preconditioner` for all cycle types. For K-cycles, the `LinearOperator`
+returns the actual per-application FMA cost; for other cycles, it returns a fixed cost.
 
-        num_multiplications = work_lookup[idx, "Work"]
+# Keyword Arguments
+- `cycle::Symbol = :V` — Cycle type: `:V`, `:W`, `:F`, `:AMLI`, `:K`
+- `num_cycles::Int = 1` — Number of multigrid cycles per apply
+- `k_cg_iters::Int = 1` — FCG iterations per level for K-cycles (paper's ℓ)
+- `k_early_exit::Float64 = 0.0` — K-cycle early exit threshold on ‖r‖/‖r₀‖ (0 = disabled)
+- `coarse_solver::Symbol = :pinv` — Coarse level solver: `:pinv`, `:lu`, `:cholesky`, `:splu`, `:cg`
+- `strength` — Strength of connection: `:symmetric`, `:classical`, `:evolution`,
+  `:distance`, `:algebraic_distance`, `:affinity`, `:energy_based`, `nothing`.
+  Use `(:method, (theta=0.25,))` for sub-options.
+- `CF` — C/F splitting: `:RS`, `:PMIS`, `:PMISc`, `:CLJP`, `:CLJPc`, `:CR`.
+  Use `(:method, (second_pass=false,))` for sub-options.
+- `interpolation` — Interpolation: `:direct`, `:classical`
+- `presmoother` — Presmoother specification (see smoother format below)
+- `postsmoother` — Postsmoother specification
+- `max_levels::Int = 30`
+- `max_coarse::Int = 10`
 
-        pfunc, _ = CombinatorialMultigrid.cmg_preconditioner_lap(mat.Laplacian)
+# Smoother Format
+- `:gauss_seidel` — method with defaults
+- `(:gauss_seidel, (sweep=:forward, iterations=2))` — method with options
+- `[:gauss_seidel, (:jacobi, (omega=0.8,))]` — per-level specification
 
-        # pfunc, H, M, W, X = CombinatorialMultigrid.cmg_preconditioner_lap(mat.Laplacian)
-        # num_multiplications = preconditioner_i(H, W, X, mat.b)
+Valid smoother methods: `gauss_seidel`, `block_gauss_seidel`, `jacobi`,
+`block_jacobi`, `cf_jacobi`, `fc_jacobi`, `cf_block_jacobi`, `fc_block_jacobi`,
+`richardson`, `sor`, `chebyshev`, `gauss_seidel_nr`, `gauss_seidel_ne`,
+`jacobi_ne`, `cg`, `gmres`, `cgne`, `cgnr`, `schwarz`,
+`strength_based_schwarz`, `nothing`.
+"""
+function PyAMGRuStu(A::SparseMatrixCSC;
+    cycle::Symbol = :V,
+    num_cycles::Int = 1,
+    k_cg_iters::Int = 1,
+    k_early_exit::Real = 0.0,
+    coarse_solver::Symbol = :pinv,
+    strength = (:classical, (theta=0.25,)),
+    CF = (:RS, (second_pass=false,)),
+    interpolation::Symbol = :classical,
+    presmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    max_levels::Int = 30,
+    max_coarse::Int = 10,
+)
+    kwargs = _parse_common_pyamg_opts(; cycle, num_cycles, coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
 
-        # open(cmg_path, "a") do io
-        #     write(io, "$(mat.name),$num_multiplications\n")
-        # end
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("CF", CF, PYAMG_CF_METHODS)
+    interpolation in PYAMG_INTERPOLATION_METHODS || error("Invalid interpolation: $interpolation. Valid: $PYAMG_INTERPOLATION_METHODS")
 
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:CF] = _option_to_py(CF)
+    kwargs[:interpolation] = _to_py(interpolation)
 
-        function LinearOperator(y, r)
-            y .= pfunc(r)
-        end
-
-        return Preconditioner(LinearOperator, num_multiplications, Inf, mat)
-
-    catch y
-        println("Error creating Combinatorial Multigrid Preconditioner for $(mat.name).")
-        rethrow(y)
-    end
+    return _build_pyamg(A, :ruge_stuben_solver, kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
 end
 
+function PyAMGRuStu(A::SparseMatrixCSC, ::Type{OptionedPreconditioner};
+    coarse_solver::Symbol = :pinv,
+    strength = (:classical, (theta=0.25,)),
+    CF = (:RS, (second_pass=false,)),
+    interpolation::Symbol = :classical,
+    presmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    max_levels::Int = 30,
+    max_coarse::Int = 10,
+    keep::Bool = false,
+)
+    kwargs = _parse_setup_pyamg_opts(; coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
 
-function CombinatorialMG(input::package, run_on::package)
-    try
-        work_lookup = CSV.read(joinpath(EXT, "CombinatorialWorkCost.csv"), DataFrame)
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("CF", CF, PYAMG_CF_METHODS)
+    interpolation in PYAMG_INTERPOLATION_METHODS || error("Invalid interpolation: $interpolation. Valid: $PYAMG_INTERPOLATION_METHODS")
 
-        idx = findfirst(x -> x == input.name, work_lookup[!, "Matrix"])
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:CF] = _option_to_py(CF)
+    kwargs[:interpolation] = _to_py(interpolation)
+    kwargs[:keep] = keep
 
-        if idx === nothing
-            throw(ArgumentError("Matrix not found in the lookup table."))
-        end
-
-        num_multiplications = work_lookup[idx, "Work"]
-
-        A_, b = make_augmented(input.A, input.b)
-        pfunc, _ = CombinatorialMultigrid.cmg_preconditioner_lap(A_)
-
-        sz = Integer(size(input.A, 1))
-
-        sol_ = zeros(size(A_, 1))
-        rhs = zeros(size(A_, 1))
-
-        function LinearOperator(sol, r)
-
-            sol .= r
-
-            rhs[1:sz] .= sol
-            rhs[sz+1:end] .= .-sol
-
-            sol_ .= pfunc(rhs)
-
-            sol .= view(sol_, 1:sz) .- view(sol_, sz+1:length(sol_))
-
-        end
-
-        return Preconditioner(LinearOperator, num_multiplications, Inf, run_on)
-
-
-    catch y
-        println("Error creating Combinatorial Multigrid Preconditioner for $(input.name).")
-        rethrow(y)
-    end
+    return _build_pyamg_hierarchy(A, :ruge_stuben_solver, kwargs)
 end
 
+# ── Smoothed Aggregation ─────────────────────────────────────────────────────
 
-function Control(mat::problem_interface)
-    return _Control(mat.Scaled)
+"""
+    PyAMGSmAgg(A; kwargs...) -> Preconditioner
+
+Smoothed Aggregation AMG preconditioner via PyAMG.
+Returns `Preconditioner` for all cycle types. For K-cycles, the `LinearOperator`
+returns the actual per-application FMA cost; for other cycles, it returns a fixed cost.
+
+# Keyword Arguments
+- `cycle::Symbol = :V` — Cycle type: `:V`, `:W`, `:F`, `:AMLI`, `:K`
+- `num_cycles::Int = 1` — Number of multigrid cycles per apply
+- `k_cg_iters::Int = 1` — FCG iterations per level for K-cycles (paper's ℓ)
+- `k_early_exit::Float64 = 0.0` — K-cycle early exit threshold on ‖r‖/‖r₀‖ (0 = disabled)
+- `coarse_solver::Symbol = :pinv` — Coarse level solver: `:pinv`, `:lu`, `:cholesky`, `:splu`, `:cg`
+- `strength` — Strength of connection (same options as `PyAMGRuStu`)
+- `aggregate` — Aggregation: `:standard`, `:lloyd`, `:balanced_lloyd`, `:naive`,
+  `:pairwise`, `:metis`. Use `(:method, (key=val,))` for sub-options.
+- `smooth` — Prolongation smoothing: `:jacobi`, `:richardson`, `:energy`, `nothing`.
+  Use `(:jacobi, (omega=4/3,))` for sub-options.
+- `presmoother` — Presmoother specification (see `PyAMGRuStu`)
+- `postsmoother` — Postsmoother specification
+- `improve_candidates` — Candidate improvement smoother, or `nothing`
+- `max_levels::Int = 10`
+- `max_coarse::Int = 10`
+- `diagonal_dominance::Bool = false`
+"""
+function PyAMGSmAgg(A::SparseMatrixCSC;
+    cycle::Symbol = :V,
+    num_cycles::Int = 1,
+    k_cg_iters::Int = 1,
+    k_early_exit::Real = 0.0,
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = (:jacobi, (omega=4.0/3.0,)),
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    improve_candidates = (:block_gauss_seidel, (sweep=:symmetric, iterations=4)),
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+    diagonal_dominance::Bool = false,
+)
+    kwargs = _parse_common_pyamg_opts(; cycle, num_cycles, coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+    kwargs[:symmetry] = _to_py(:symmetric)
+
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_SA_SMOOTH_METHODS)
+    improve_candidates !== nothing && _validate_smoother("improve_candidates", improve_candidates)
+
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:aggregate] = _aggregate_to_py(aggregate)
+    kwargs[:smooth] = _option_to_py(smooth)
+    kwargs[:improve_candidates] = _option_to_py(improve_candidates)
+    kwargs[:diagonal_dominance] = diagonal_dominance
+
+    return _build_pyamg(A, :smoothed_aggregation_solver, kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
 end
 
+function PyAMGSmAgg(A::SparseMatrixCSC, ::Type{OptionedPreconditioner};
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = (:jacobi, (omega=4.0/3.0,)),
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    improve_candidates = (:block_gauss_seidel, (sweep=:symmetric, iterations=4)),
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+    diagonal_dominance::Bool = false,
+    keep::Bool = false,
+)
+    kwargs = _parse_setup_pyamg_opts(; coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+    kwargs[:symmetry] = _to_py(:symmetric)
 
-function _Control(input::package)
-    function LinearOperator(y, r)
-        y .= r
-    end
-    num_multiplications = 0
-    println("Created Control Preconditioner for $(input.name).")
-    return Preconditioner(LinearOperator, num_multiplications, 0.0, input)
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_SA_SMOOTH_METHODS)
+    improve_candidates !== nothing && _validate_smoother("improve_candidates", improve_candidates)
+
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:aggregate] = _aggregate_to_py(aggregate)
+    kwargs[:smooth] = _option_to_py(smooth)
+    kwargs[:improve_candidates] = _option_to_py(improve_candidates)
+    kwargs[:diagonal_dominance] = diagonal_dominance
+    kwargs[:keep] = keep
+
+    return _build_pyamg_hierarchy(A, :smoothed_aggregation_solver, kwargs)
 end
 
+# ── Rootnode ─────────────────────────────────────────────────────────────────
+
+"""
+    PyAMGRootnode(A; kwargs...) -> Preconditioner
+
+Root-node Smoothed Aggregation AMG preconditioner via PyAMG.
+Returns `Preconditioner` for all cycle types. For K-cycles, the `LinearOperator`
+returns the actual per-application FMA cost; for other cycles, it returns a fixed cost.
+
+Same interface as `PyAMGSmAgg` except `smooth` only supports `:energy` and `nothing`.
+"""
+function PyAMGRootnode(A::SparseMatrixCSC;
+    cycle::Symbol = :V,
+    num_cycles::Int = 1,
+    k_cg_iters::Int = 1,
+    k_early_exit::Real = 0.0,
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = :energy,
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    improve_candidates = (:block_gauss_seidel, (sweep=:symmetric, iterations=4)),
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+    diagonal_dominance::Bool = false,
+)
+    kwargs = _parse_common_pyamg_opts(; cycle, num_cycles, coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+    kwargs[:symmetry] = _to_py(:symmetric)
+
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_ROOTNODE_SMOOTH_METHODS)
+    improve_candidates !== nothing && _validate_smoother("improve_candidates", improve_candidates)
+
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:aggregate] = _aggregate_to_py(aggregate)
+    kwargs[:smooth] = _option_to_py(smooth)
+    kwargs[:improve_candidates] = _option_to_py(improve_candidates)
+    kwargs[:diagonal_dominance] = diagonal_dominance
+
+    return _build_pyamg(A, :rootnode_solver, kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
 end
+
+function PyAMGRootnode(A::SparseMatrixCSC, ::Type{OptionedPreconditioner};
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = :energy,
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    improve_candidates = (:block_gauss_seidel, (sweep=:symmetric, iterations=4)),
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+    diagonal_dominance::Bool = false,
+    keep::Bool = false,
+)
+    kwargs = _parse_setup_pyamg_opts(; coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+    kwargs[:symmetry] = _to_py(:symmetric)
+
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_ROOTNODE_SMOOTH_METHODS)
+    improve_candidates !== nothing && _validate_smoother("improve_candidates", improve_candidates)
+
+    kwargs[:strength] = _option_to_py(strength)
+    kwargs[:aggregate] = _aggregate_to_py(aggregate)
+    kwargs[:smooth] = _option_to_py(smooth)
+    kwargs[:improve_candidates] = _option_to_py(improve_candidates)
+    kwargs[:diagonal_dominance] = diagonal_dominance
+    kwargs[:keep] = keep
+
+    return _build_pyamg_hierarchy(A, :rootnode_solver, kwargs)
+end
+
+# ── Pairwise ─────────────────────────────────────────────────────────────────
+
+"""
+    PyAMGPairwise(A; kwargs...) -> Preconditioner
+
+Pairwise Aggregation AMG preconditioner via PyAMG.
+Returns `Preconditioner` for all cycle types. For K-cycles, the `LinearOperator`
+returns the actual per-application FMA cost; for other cycles, it returns a fixed cost.
+
+# Keyword Arguments
+- `cycle::Symbol = :V` — Cycle type: `:V`, `:W`, `:F`, `:AMLI`, `:K`
+- `num_cycles::Int = 1` — Number of multigrid cycles per apply
+- `k_cg_iters::Int = 1` — FCG iterations per level for K-cycles (paper's ℓ)
+- `k_early_exit::Float64 = 0.0` — K-cycle early exit threshold on ‖r‖/‖r₀‖ (0 = disabled)
+- `theta::Float64 = 0.25` — Pairwise aggregation strength threshold
+- `norm::Symbol = :min` — Norm for pairwise matching: `:min`, `:abs`, `:max`
+- `matchings::Int = 2` — Number of pairwise matchings per level
+- `presmoother` — Presmoother specification (see `PyAMGRuStu`)
+- `postsmoother` — Postsmoother specification
+- `max_levels::Int = 20`
+- `max_coarse::Int = 10`
+"""
+function PyAMGPairwise(A::SparseMatrixCSC;
+    cycle::Symbol = :V,
+    num_cycles::Int = 1,
+    k_cg_iters::Int = 1,
+    k_early_exit::Real = 0.0,
+    coarse_solver::Symbol = :pinv,
+    theta::Real = 0.25,
+    norm::Symbol = :min,
+    matchings::Int = 2,
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    max_levels::Int = 20,
+    max_coarse::Int = 10,
+)
+    kwargs = _parse_common_pyamg_opts(; cycle, num_cycles, coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+
+    norm in (:min, :abs) || error("Invalid norm: $norm. Valid: :min, :abs")
+    matchings >= 1 || error("matchings must be >= 1, got $matchings")
+
+    kwargs[:aggregate] = _aggregate_to_py((:pairwise, (theta=theta, norm=norm, matchings=matchings)))
+
+    return _build_pyamg(A, :pairwise_solver, kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
+end
+
+function PyAMGPairwise(A::SparseMatrixCSC, ::Type{OptionedPreconditioner};
+    coarse_solver::Symbol = :pinv,
+    theta::Real = 0.25,
+    norm::Symbol = :min,
+    matchings::Int = 2,
+    presmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    postsmoother = (:block_gauss_seidel, (sweep=:symmetric,)),
+    max_levels::Int = 20,
+    max_coarse::Int = 10,
+)
+    kwargs = _parse_setup_pyamg_opts(; coarse_solver, presmoother, postsmoother, max_levels, max_coarse)
+
+    norm in (:min, :abs) || error("Invalid norm: $norm. Valid: :min, :abs")
+    matchings >= 1 || error("matchings must be >= 1, got $matchings")
+
+    kwargs[:aggregate] = _aggregate_to_py((:pairwise, (theta=theta, norm=norm, matchings=matchings)))
+
+    return _build_pyamg_hierarchy(A, :pairwise_solver, kwargs)
+end
+
+# ── Adaptive SA ──────────────────────────────────────────────────────────────
+
+"""
+    PyAMGAdaptive(A; kwargs...) -> Preconditioner
+
+Adaptive Smoothed Aggregation AMG preconditioner via PyAMG.
+Automatically discovers near-nullspace candidates via relaxation.
+
+# Keyword Arguments
+- `cycle::Symbol = :V` — Cycle type: `:V`, `:W`, `:F`, `:AMLI`, `:K`
+- `num_cycles::Int = 1` — Number of multigrid cycles per apply
+- `k_cg_iters::Int = 1` — FCG iterations per level for K-cycles
+- `k_early_exit::Float64 = 0.0` — K-cycle early exit threshold
+- `coarse_solver::Symbol = :pinv` — Coarse level solver
+- `strength` — Strength of connection (same options as `PyAMGRuStu`)
+- `aggregate` — Aggregation method (same options as `PyAMGSmAgg`)
+- `smooth` — Prolongation smoothing: `:jacobi`, `:richardson`, `:energy`, `nothing`
+- `prepostsmoother` — Smoother used for both pre and post (see `PyAMGRuStu`)
+- `num_candidates::Int = 1` — Number of near-nullspace candidates to generate
+- `candidate_iters::Int = 5` — Smoothing passes per level in adaptive setup
+- `improvement_iters::Int = 0` — Number of candidate improvement passes
+- `epsilon::Float64 = 0.1` — Target convergence factor
+- `max_levels::Int = 10`
+- `max_coarse::Int = 10`
+"""
+function PyAMGAdaptive(A::SparseMatrixCSC;
+    cycle::Symbol = :V,
+    num_cycles::Int = 1,
+    k_cg_iters::Int = 1,
+    k_early_exit::Real = 0.0,
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = (:jacobi, NamedTuple()),
+    prepostsmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    num_candidates::Int = 1,
+    candidate_iters::Int = 5,
+    improvement_iters::Int = 0,
+    epsilon::Real = 0.1,
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+)
+    cycle in PYAMG_CYCLES || error("Invalid cycle: $cycle. Valid: $PYAMG_CYCLES")
+    num_cycles >= 1 || error("num_cycles must be >= 1, got $num_cycles")
+    coarse_solver in PYAMG_COARSE_SOLVERS || error("Invalid coarse_solver: $coarse_solver. Valid: $PYAMG_COARSE_SOLVERS")
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_SA_SMOOTH_METHODS)
+    _validate_smoother("prepostsmoother", prepostsmoother)
+
+    kwargs = Dict{Symbol, Any}(
+        :symmetry => _to_py(:symmetric),
+        :pdef => true,
+        :coarse_solver => _to_py(coarse_solver),
+        :max_levels => max_levels,
+        :max_coarse => max_coarse,
+        :strength => _option_to_py(strength),
+        :aggregate => _option_to_py(aggregate),
+        :smooth => _option_to_py(smooth),
+        :prepostsmoother => _option_to_py(prepostsmoother),
+        :num_candidates => num_candidates,
+        :candidate_iters => candidate_iters,
+        :improvement_iters => improvement_iters,
+        :epsilon => epsilon,
+    )
+
+    return _build_pyamg(A, :adaptive_sa_solver, kwargs; cycle, num_cycles, k_cg_iters, k_early_exit)
+end
+
+function PyAMGAdaptive(A::SparseMatrixCSC, ::Type{OptionedPreconditioner};
+    coarse_solver::Symbol = :pinv,
+    strength = :symmetric,
+    aggregate = :standard,
+    smooth = (:jacobi, NamedTuple()),
+    prepostsmoother = (:gauss_seidel, (sweep=:symmetric,)),
+    num_candidates::Int = 1,
+    candidate_iters::Int = 5,
+    improvement_iters::Int = 0,
+    epsilon::Real = 0.1,
+    max_levels::Int = 10,
+    max_coarse::Int = 10,
+    keep::Bool = false,
+)
+    coarse_solver in PYAMG_COARSE_SOLVERS || error("Invalid coarse_solver: $coarse_solver. Valid: $PYAMG_COARSE_SOLVERS")
+    _validate_option("strength", strength, PYAMG_STRENGTH_METHODS)
+    _validate_option("aggregate", aggregate, PYAMG_AGGREGATE_METHODS)
+    _validate_option("smooth", smooth, PYAMG_SA_SMOOTH_METHODS)
+    _validate_smoother("prepostsmoother", prepostsmoother)
+
+    kwargs = Dict{Symbol, Any}(
+        :symmetry => _to_py(:symmetric),
+        :pdef => true,
+        :coarse_solver => _to_py(coarse_solver),
+        :max_levels => max_levels,
+        :max_coarse => max_coarse,
+        :strength => _option_to_py(strength),
+        :aggregate => _option_to_py(aggregate),
+        :smooth => _option_to_py(smooth),
+        :prepostsmoother => _option_to_py(prepostsmoother),
+        :num_candidates => num_candidates,
+        :candidate_iters => candidate_iters,
+        :improvement_iters => improvement_iters,
+        :epsilon => epsilon,
+        :keep => keep,
+    )
+
+    return _build_pyamg_hierarchy(A, :adaptive_sa_solver, kwargs)
+end
+
+end # module Preconditioners

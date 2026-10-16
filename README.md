@@ -1,176 +1,117 @@
 # CAPPABenchmarkTools.jl
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
+A Julia framework for benchmarking preconditioned Krylov solvers on sparse
+symmetric systems. It records numerical diagnostics and modeled computational
+work, separately from measured wall time and resource usage.
 
-A lightweight Julia toolbox for benchmarking sparse linear solvers and preconditioners. See the accompanying paper on [arXiv](https://doi.org/10.48550/arXiv.2505.20696) and view the most up-to-date data on our [repository of results](tunnellm.github.io/CAPPA-repository/).
+This is a matrix-focused infrastructure release, not a production
+experiment grid, dataset, scheduler, or paper analysis. See
+[release scope](docs/release_scope.md), [changes from 0.1.0](docs/changes.md), and the
+[numerical/output contract](docs/numerical_contract.md).
 
-## Features
+## Capabilities
 
-- **Sparse triangular solves** via built-in and custom kernels
-- **CG** and **MINRES** implementations that emit per-iteration data for detailed profiling
-- **Uniform “preconditioner” wrapper**—turn any Julia‐callable into a `Preconditioner` object that tracks operator applications
-- Utilities for loading MatrixMarket graphs & matrices, computing norms, reordering, scaling, and more
+- PCG, Lanczos-PCG, MINRES, PCR, and two flexible PCG variants.
+- Work-counted incomplete factorizations, stationary and polynomial methods,
+  sparse approximate inverses, PyAMG, HYPRE, and Laplacians.jl wrappers.
+- Component decomposition, symmetric scaling, cached orderings, and bounded
+  preparation diagnostics. Preparation estimates the upper eigenvalue; it does
+  not promise an accurate smallest eigenvalue or condition number.
+- Charged residual certification, bounded continuation without restarts, and
+  recorded correction restarts in the default certified mode.
+- Bounded diagnostic/coefficient buffers, versioned compressed output, and
+  readers for legacy monolithic NPY output (not the old public CSV format).
+- Generic phase, resource, and numerical-progress callbacks.
+
+Most methods require an SPD operator and suitable positive-definite
+preconditioning. MINRES also supports symmetric indefinite operators with
+appropriate SPD preconditioning. This is not a general nonsymmetric solver.
 
 ## Installation
 
+The release target is Linux x86-64 with Julia 1.12 (validation uses 1.12.5).
+Install Git, CMake, Make, a C/C++ toolchain with OpenMP, and gfortran first.
+Allow network access and writable storage during setup. Importing the package
+builds missing native libraries; this is not a compilation-free import.
+
 ```bash
 git clone --recurse-submodules https://github.com/tunnellm/CAPPABenchmarkTools.jl.git
-julia -e 'import Pkg; Pkg.develop(path="CAPPABenchmarkTools.jl")'
+cd CAPPABenchmarkTools.jl
+CAPPA_BUILD_JOBS=4 JULIA_NUM_PRECOMPILE_TASKS=2 \
+  julia --startup-file=no --project=. scripts/setup.jl
 ```
 
-Then in Julia:
-```julia
-using CAPPABenchmarkTools
+`CAPPA_BUILD_JOBS` bounds HYPRE build parallelism (default: at most four
+processes); it is not a runtime thread setting.
+
+`Project.toml` selects the pinned Laplacians submodule when this checkout is the
+active project. CondaPkg installs NumPy, SciPy, and the pinned editable PyAMG
+fork; setup verifies the imported PyAMG path. The forked dependencies carry
+work instrumentation and correctness fixes. Stock packages are not equivalent.
+
+For a separate Julia application environment, explicitly develop both the
+Laplacians submodule and this package into that environment. Dependency-local
+`[sources]` settings must not be assumed to configure a consuming application.
+Ordering subprocesses use that application's resolved environment as well.
+
+## Runnable Example
+
+No dataset download is needed:
+
+```bash
+julia --startup-file=no --threads=2 --project=. examples/synthetic.jl
 ```
 
-## Dependencies
+This solves a small synthetic SPD problem using SGS-preconditioned PCG, checks
+the returned solution's residual, and writes diagnostics under `examples/output`.
+The known solution is supplied for error diagnostics, not as an initial guess
+or input to the stopping policy.
 
-* SparseArrays, LinearAlgebra, Statistics
-* Laplacians, CombinatorialMultigrid, LDLFactorizations
-* PyCall, MATLAB, CSV, DataFrames, CodecZstd, TranscodingStreams, BufferedStreams, MatrixMarket
-* StableRNGs, Random, AMD, SymRCM, GenericArpack
+For a complete synthetic preparation -> Control -> preconditioned-run example:
 
-```julia
-] add SparseArrays, add LinearAlgebra, add Statistics
-] add Laplacians, add CombinatorialMultigrid, add LDLFactorizations
-] add PyCall, add MATLAB, add CSV, add DataFrames, add CodecZstd, add TranscodingStreams, add BufferedStreams, add MatrixMarket
-] add StableRNGs, add Random, add AMD, add SymRCM, add GenericArpack
+```bash
+julia --startup-file=no --threads=2 --project=. examples/matrix_pipeline.jl
 ```
 
-## Directory layout assumptions
+For file-based benchmarks, place `<name>.mtx` under `matrices/<name>/` and use
+`run_matrix(name, preconditioner; ...)`. This is a preparation pipeline, not a
+read-only loader: it writes caches and may delete the original MatrixMarket
+file after successful preparation. Keep a separate input copy. Non-Control
+runs use Control baselines for their work budgets when available. Bounded
+continuation requires existing converged baselines; ordinary certified runs can
+run without a Control-derived work limit. Components of dimension 50 or less
+are skipped by `run_matrix`; use the direct solver API for smaller problems.
 
-This package assumes the following directory layout for graphs and matrices.
+## Tests
 
-```
-.
-├─ matrices/
-│  └─ <matrix_name>/
-│     └─ <matrix_name>.mtx
-└─ graphs/
-   └─ <graph_name>/
-      └─ <graph_name>.mtx
-```
-
-Please make sure these files exist before calling `Utilities.load_matrix` or `Utilities.load_graph`.
-
-
-## Loading the package
-
-You can load everything into the namespace:
-
-```julia
-using CAPPABenchmarkTools
+```bash
+julia --startup-file=no --threads=2 --project=. -e 'using Pkg; Pkg.test()'
 ```
 
-or load just what you need:
+Tests use synthetic fixtures and pinned native/Python backends. They do not
+require a cluster or production results. Timing experiments
+and machine-dependent allocation thresholds are not presented as correctness
+tests in this release.
 
-```julia
-using CAPPABenchmarkTools.Utilities
-using CAPPABenchmarkTools: Preconditioner, preconditioned_conjugate_gradient
-```
+## Research and License
 
-## Quickstart guide
+This software accompanies [An Empirical Study of Conjugate Gradient Preconditioners
+for Solving Symmetric Positive Definite Systems of Linear Equations](https://doi.org/10.48550/arXiv.2505.20696).
+Results generated with earlier software versions may use different stopping,
+accounting, or storage contracts than this release.
 
-```julia
-using CAPPABenchmarkTools
+To cite the paper:
 
-# load a "problem interface"
-prob = load_matrix("1138_bus", "natural");
-
-# Access the scaled system
-pkg = prob.Scaled
-
-# 2. Build a preconditioner (wrap a function, lets use identity)
-M = Preconditioner(
-  LinearOperator = (y, x) -> y .= x, # our linear operator overwrites the y with the result applied to x.
-  num_multiplications = 0, # keep track of work applied by the preconditioner, here we do 0 work.
-  system = pkg
-)
-
-# Alternatively, we could have called
-Q = Control(prob); # this uses the Scaled system by default.
-
-# 3. Run CG or MINRES
-res = preconditioned_conjugate_gradient(
-  preconditioner = M, # the struct already holds the system data.
-  maxiters = 100,
-  raw_data_out = "temp/raw_data.csv.zstd", # location to output all performance data.
-  convergence_data_out = "temp/convergence_data_"; # this will output convergence data with respect to multiple metrics.
-  work_limit = 40000 # stops the solver if we exceeed an amount of work. We use this to limit a preconditioned run if it exceeds some multiple of the work to converge without preconditioning.
-);
-
-# Alternatively, we could use the wrapper as follows.
-
-run_matrix(
-  matrix_name = "1138_bus", # provide just the matrix name
-  preconditioners = Function[Control], # provide a vector of preconditioner functions (defined in Preconditioners)
-  args = [nothing], # provide a vector of tuples of arguments, or provide "nothing" if the preconditioner takes no arguments.
-  reordering = "Natural"; # the name of the ordering. Currently: Natural, AMD, or RCM
-  run_conjugate_gradient = true, # run one of or both solvers.
-  run_minres = false
-)
-
-# Or as follows:
-
-run_matrix(
-  matrix = prob, # provide just problem interface
-  preconditioners = Function[Control], # provide a vector of preconditioner functions (defined in Preconditioners)
-  args = [nothing], # provide a vector of tuples of arguments, or provide "nothing" if the preconditioner takes no arguments.
-  reordering = "Natural"; # the name of the ordering. Currently: Natural, AMD, or RCM
-  run_conjugate_gradient = true, # run one of or both solvers.
-  run_minres = false
-)
-```
-
-## Core types
-
-```julia
-struct norm_information
-    spectral_norm::Float64
-    infinity_norm::Float64
-    frobenius_norm::Float64
-    jacobian::Float64
-end
-
-struct package
-    A::SparseMatrixCSC
-    b::Vector
-    seed::Vector
-    name::String
-    norms::norm_information
-    diagonally_dominant::Bool
-    nullspace::Int64
-end
-
-struct Preconditioner
-    LinearOperator::Function
-    num_multiplications::UInt64
-    system::package
-end
-```
-
-## Utilities
-
-All behind-the-scenes routines live in `Utilities`:
-
-- I/O: `load_matrix`, `load_graph`, `load_matrix_names`, `check_previous`
-- Matrix transforms: `make_augmented`, `extract_negative`, `laplace_to_adj`
-- Norms & tolerances: `compute_operator_norms`, `compute_tolerances`
-- Problem inspection: `is_laplacian`, `is_sdd`
-
-## Use this repository in your research?
-
-```
+```bibtex
 @misc{tunnell_arxiv_2025,
-  doi = {10.48550/ARXIV.2505.20696},
-  url = {https://arxiv.org/abs/2505.20696},
-  author = {Tunnell,  Marc A. and Gleich,  David F.},
-  keywords = {Numerical Analysis (math.NA),  FOS: Mathematics,  FOS: Mathematics},
+  author = {Tunnell, Marc A. and Gleich, David F.},
   title = {An Empirical Study of Conjugate Gradient Preconditioners for Solving Symmetric Positive Definite Systems of Linear Equations},
-  publisher = {arXiv},
   year = {2025},
-  copyright = {arXiv.org perpetual,  non-exclusive license}
+  doi = {10.48550/arXiv.2505.20696},
+  url = {https://arxiv.org/abs/2505.20696}
 }
 ```
 
-License: This project is MIT-licensed. See [license](LICENSE.md).
+The Julia project is MIT-licensed; see [LICENSE.md](LICENSE.md). External
+components retain their own licenses and notices, including the vendored
+[LAPACK notice](External/lapack/LICENSE).

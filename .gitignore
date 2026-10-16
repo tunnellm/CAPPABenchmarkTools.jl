@@ -3,7 +3,11 @@ Manifest.toml
 
 # Conda/CondaPkg
 .CondaPkg/
-CondaPkg.toml
+__pycache__/
+*.so
+*.dylib
+/examples/output/
+/test/output/
 
 # IDE
 .vscode/

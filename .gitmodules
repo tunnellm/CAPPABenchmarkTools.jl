@@ -12,3 +12,9 @@
 [submodule "External/pyamg"]
 	path = External/pyamg
 	url = https://github.com/tunnellm/pyamg
+[submodule "External/hypre"]
+	path = External/hypre
+	url = https://github.com/tunnellm/hypre
+[submodule "External/Laplacians"]
+	path = External/Laplacians
+	url = https://github.com/tunnellm/Laplacians.jl.git
