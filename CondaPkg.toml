@@ -1,0 +1,11 @@
+[deps]
+python = ">=3.10,<3.13"
+numpy = ""
+scipy = ""
+
+[pip.deps.pyamg]
+version = "@ ./External/pyamg"
+editable = true
+
+[pip.deps.dill]
+version = ""

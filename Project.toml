@@ -1,7 +1,7 @@
 name = "CAPPABenchmarkTools"
 uuid = "7b51623a-7b9f-442f-92c6-1241bfbe1acc"
 authors = ["Marc Tunnell <mtunnell@purdue.edu>"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 AMD = "14f7f29c-3bd6-536c-9a0b-7339e30b5a3e"
@@ -11,14 +11,13 @@ CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
 CombinatorialMultigrid = "44808c39-7784-4d8d-8dbc-3ef853c709a1"
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
-FFMPEG = "c87230d0-a227-11e9-1b43-d7ebe4e7570a"
-GenericArpack = "408c25d7-97fa-4992-8bd9-ce15f1a09fe9"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 LDLFactorizations = "40e66cde-538c-5869-a4ad-c39174c6795b"
 Laplacians = "6f8e5838-0efe-5de0-80a3-5fb4f8dbb1de"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LimitedLDLFactorizations = "f5a24dde-3ab7-510b-b81b-6a72c6098d3b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
-MATLAB = "10e44e05-a98a-55b3-a45b-ba969058deb6"
 MatrixMarket = "4d4711f2-db25-561a-b6b3-d35e7d4047d3"
 Metis = "2679e427-3c69-5b7f-982b-ece356f1e94b"
 Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
@@ -27,6 +26,7 @@ PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RandomizedPreconditioners = "3e7891d3-c9d1-416a-9949-ebd96150e4f0"
 Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StableRNGs = "860ef19b-820b-49d6-a774-d7a799459cd3"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
@@ -36,12 +36,26 @@ TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 VectorizedStatistics = "3b853605-1c98-4422-8364-4bd93ee0529e"
 
 [compat]
+julia = "1.12"
 CondaPkg = "0.2.29"
+JSON3 = "1.14.3"
+Libdl = "1.11.0"
 LimitedLDLFactorizations = "0.5.0"
-LoopVectorization = "0.12.173"
 Metis = "1.5.0"
 Polyester = "0.7.18"
-PythonCall = "0.9.25"
+PythonCall = "0.9.31"
 RandomizedPreconditioners = "0.1.7"
+SHA = "0.7.0"
 SuiteSparseMatrixCollection = "0.5.7"
 VectorizedStatistics = "0.5.11"
+
+[sources]
+Laplacians = {path = "External/Laplacians"}
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+
+[targets]
+test = ["Test", "Serialization", "TOML"]
